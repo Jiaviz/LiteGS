@@ -23,6 +23,11 @@ from .. import utils
 def __l1_loss(network_output:torch.Tensor, gt:torch.Tensor)->torch.Tensor:
     return torch.abs((network_output - gt)).mean()
 
+def __safe_masked_mean(values:torch.Tensor, weights:torch.Tensor)->torch.Tensor:
+    weighted_sum = (values * weights).sum()
+    normalizer = weights.sum().clamp_min(1.0)
+    return weighted_sum / normalizer
+
 def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.PipelineParams,dp:arguments.DensifyParams,
           test_epochs=[],save_ply=[],save_checkpoint=[],start_checkpoint:str=None):
     
@@ -47,11 +52,17 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
     else:
         training_frames=camera_frames
         test_frames=None
-    trainingset=data.CameraFrameDataset(cameras_info,training_frames,lp.resolution,pp.device_preload)
+    mask_root=os.path.join(lp.source_path,"masks")
+    has_masks=os.path.isdir(mask_root)
+    if has_masks:
+        pp.enable_transmitance=True
+        dp.densify_until = 0
+        print("[LiteGS] Disabling densification for masked object-centric training.")
+    trainingset=data.CameraFrameDataset(cameras_info,training_frames,lp.resolution,pp.device_preload,mask_root=mask_root)
     train_loader = DataLoader(trainingset, batch_size=1,shuffle=True,pin_memory=not pp.device_preload)
     test_loader=None
     if lp.eval:
-        testset=data.CameraFrameDataset(cameras_info,test_frames,lp.resolution,pp.device_preload)
+        testset=data.CameraFrameDataset(cameras_info,test_frames,lp.resolution,pp.device_preload,mask_root=mask_root)
         test_loader = DataLoader(testset, batch_size=1,shuffle=False,pin_memory=not pp.device_preload)
     norm_trans,norm_radius=trainingset.get_norm()
     frames_buffer=data.FramesBuffer(trainingset)
@@ -60,6 +71,12 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
     cluster_origin=None
     cluster_extend=None
     init_points_num=init_xyz.shape[0]
+    if has_masks and pp.cluster_size:
+        print(f"[LiteGS] Disabling clustering for masked training data at {mask_root}.")
+        pp.cluster_size = 0
+    if pp.cluster_size and init_points_num < pp.cluster_size:
+        print(f"[LiteGS] Disabling clustering because only {init_points_num} points are available (< cluster_size={pp.cluster_size}).")
+        pp.cluster_size = 0
     if start_checkpoint is None:
         init_xyz=torch.tensor(init_xyz,dtype=torch.float32,device='cuda')
         init_color=torch.tensor(init_color,dtype=torch.float32,device='cuda')
@@ -108,11 +125,13 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 actived_sh_degree=min(int(epoch/5),lp.sh_degree)
         torch.cuda.synchronize()
         with StatisticsHelperInst.try_start(epoch):
-            for view_matrix,proj_matrix,frustumplane,gt_image,idx_tensor in train_loader:
+            for view_matrix,proj_matrix,frustumplane,gt_image,gt_mask,idx_tensor in train_loader:
                 view_matrix=view_matrix.cuda()
                 proj_matrix=proj_matrix.cuda()
                 frustumplane=frustumplane.cuda()
                 gt_image=gt_image.cuda()/255.0
+                gt_mask=gt_mask.cuda().float()
+                inverse_mask = 1.0 - gt_mask
                 
                 if op.learnable_viewproj:
                     #fix view matrix
@@ -142,10 +161,19 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                     actived_sh_degree,gt_image.shape[2:],pp
                 )
                 
-                loss=fused_ssim.fused_l1_ssim_loss(img,gt_image)
+                if has_masks:
+                    rgb_loss_map = fused_ssim.FusedL1SSIMLossMap.apply(0.2, 0.01 ** 2, 0.03 ** 2, img, gt_image, "same", True)
+                    loss = __safe_masked_mean(rgb_loss_map, gt_mask.expand_as(rgb_loss_map))
+                    if transmitance is not None:
+                        alpha = 1.0 - transmitance
+                        fg_alpha_loss = __safe_masked_mean((1.0 - alpha).abs(), gt_mask)
+                        bg_alpha_loss = __safe_masked_mean(alpha.abs(), inverse_mask)
+                        loss = loss + 0.0 * fg_alpha_loss + bg_alpha_loss * 5
+                else:
+                    loss=fused_ssim.fused_l1_ssim_loss(img,gt_image)
                 if op.reg_weight>0.0:
                     loss+=(culled_scale).square().mean()*op.reg_weight
-                if pp.enable_transmitance:
+                if pp.enable_transmitance and not has_masks:
                     loss+=(1-transmitance).abs().mean()
                 loss.backward()
                 if StatisticsHelperInst.bStart:
@@ -174,11 +202,12 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                     loaders["Testset"]=test_loader
                 for name,loader in loaders.items():
                     psnr_list=[]
-                    for view_matrix,proj_matrix,frustumplane,gt_image,idx in loader:
+                    for view_matrix,proj_matrix,frustumplane,gt_image,gt_mask,idx in loader:
                         view_matrix=view_matrix.cuda()
                         proj_matrix=proj_matrix.cuda()
                         frustumplane=frustumplane.cuda()
                         gt_image=gt_image.cuda()/255.0
+                        gt_mask=gt_mask.cuda().float()
                         idx=idx.cuda()
                         if op.learnable_viewproj:
                             if name=="Trainingset":
@@ -195,7 +224,10 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                         visible_chunkid,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity=render.render_preprocess(cluster_origin,cluster_extend,frustumplane,view_matrix,xyz,scale,rot,sh_0,sh_rest,opacity,op,pp,actived_sh_degree)
                         img,transmitance,depth,normal,primitive_visible=render.render(view_matrix,proj_matrix,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity,
                                                                     actived_sh_degree,gt_image.shape[2:],pp)
-                        psnr_list.append(psnr_metrics(img,gt_image).unsqueeze(0))
+                        if has_masks:
+                            psnr_list.append(psnr_metrics(img*gt_mask,gt_image*gt_mask).unsqueeze(0))
+                        else:
+                            psnr_list.append(psnr_metrics(img,gt_image).unsqueeze(0))
                     tqdm.write("\n[EPOCH {}] {} Evaluating: PSNR {}".format(epoch,name,torch.concat(psnr_list,dim=0).mean()))
 
         xyz,scale,rot,sh_0,sh_rest,opacity=density_controller.step(opt,epoch)

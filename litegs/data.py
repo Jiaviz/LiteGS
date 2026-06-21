@@ -79,8 +79,10 @@ class ImageFrame:
         self.camera_id:int=camera_id
         self.name:str=name
         self.img_source:str=img_source
+        self.mask_source:str|None=None
         self.xys:npt.NDArray=np.array(xys)
         self.image={}
+        self.mask={}
         return
     
     def load_image(self,downsample:int=-1):
@@ -108,6 +110,20 @@ class ImageFrame:
                 resolution = (int(orig_w / scale), int(orig_h / scale))  
             self.image[downsample]=np.array(image.resize(resolution),dtype=np.uint8).transpose(2,0,1)
         return self.image[downsample]
+
+    def load_mask(self,downsample:int=-1):
+        if self.mask.get(downsample,None) is None:
+            image = self.load_image(downsample)
+            mask_shape = image.shape[1:]
+            if self.mask_source is None or not os.path.exists(self.mask_source):
+                self.mask[downsample] = np.ones((1, mask_shape[0], mask_shape[1]), dtype=np.float32)
+                return self.mask[downsample]
+
+            mask_image:PIL.Image.Image = PIL.Image.open(self.mask_source).convert("L")
+            resolution = (mask_shape[1], mask_shape[0])
+            resized_mask = np.array(mask_image.resize(resolution, resample=PIL.Image.Resampling.NEAREST), dtype=np.float32)
+            self.mask[downsample] = (resized_mask > 127).astype(np.float32)[None, ...]
+        return self.mask[downsample]
     
     def get_viewmatrix(self)->npt.NDArray:
         return self.view_matrix
@@ -175,11 +191,14 @@ class CameraFrameDataset(Dataset):
         frustumplane[5,3]=viewproj_matrix[3,3]-viewproj_matrix[3,2]
         return frustumplane
     
-    def __init__(self,cameras:dict[int,PinHoleCameraInfo],frames:list[ImageFrame],downsample:int=-1,bDevice=True):
+    def __init__(self,cameras:dict[int,PinHoleCameraInfo],frames:list[ImageFrame],downsample:int=-1,bDevice=True,mask_root:str|None=None):
         self.cameras=cameras
         self.frames=frames
         self.downsample=downsample
         self.idx_array=None
+        if mask_root is not None:
+            for frame in frames:
+                frame.mask_source = os.path.join(mask_root, frame.name)
         
         if bDevice:
             for camera in cameras.values():
@@ -188,6 +207,8 @@ class CameraFrameDataset(Dataset):
                 frame.view_matrix=torch.Tensor(frame.view_matrix).cuda()
                 for key in frame.image.keys():
                     frame.image[key]=torch.tensor(frame.image[key]).cuda()
+                for key in frame.mask.keys():
+                    frame.mask[key]=torch.tensor(frame.mask[key]).cuda()
         
         #init frustumplanes
         self.frustumplanes=[]
@@ -206,13 +227,16 @@ class CameraFrameDataset(Dataset):
     def __len__(self):
         return len(self.frames)
     
-    def __getitem__(self,idx:int)->tuple[torch.Tensor,torch.Tensor,torch.Tensor]:
+    def __getitem__(self,idx:int)->tuple[torch.Tensor,torch.Tensor,torch.Tensor,torch.Tensor,torch.Tensor,torch.Tensor]:
         image=self.frames[idx].load_image(self.downsample)
+        mask=self.frames[idx].load_mask(self.downsample)
         view_matrix=self.frames[idx].get_viewmatrix()
         proj_matrix=self.cameras[self.frames[idx].camera_id].get_project_matrix()
         frustumplane=self.frustumplanes[idx]
         StatisticsHelperInst.cur_sample=self.frames[idx].name
-        return view_matrix,proj_matrix,frustumplane,image,idx
+        if torch.is_tensor(image) and not torch.is_tensor(mask):
+            mask = torch.tensor(mask, device=image.device)
+        return view_matrix,proj_matrix,frustumplane,image,mask,idx
     
     def get_norm(self)->tuple[float,float]:
         def get_center_and_diag(cam_centers):
