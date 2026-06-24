@@ -4,15 +4,13 @@ from torch.optim.lr_scheduler import _LRScheduler
 
 from .. import arguments
 from ..utils.wrapper import sparse_adam_update
-from ..utils.CompactedTensor import CompactedTensor
 
 class SparseGaussianAdam(torch.optim.Adam):
-    def __init__(self, params, lr, eps, bCluster):
-        self.bCluster=bCluster
+    def __init__(self, params, lr, eps):
         super().__init__(params=params, lr=lr, eps=eps)
     
     @torch.no_grad()
-    def step(self, visible_chunk,visible_chunks_num,primitive_visible):
+    def step(self, visible_chunk):
         for group in self.param_groups:
             lr = group["lr"]
             eps = group["eps"]
@@ -29,19 +27,12 @@ class SparseGaussianAdam(torch.optim.Adam):
                 state['exp_avg'] = torch.zeros_like(param, memory_format=torch.preserve_format)
                 state['exp_avg_sq'] = torch.zeros_like(param, memory_format=torch.preserve_format)
 
-            if self.bCluster:
-                stored_state = self.state.get(param, None)
-                exp_avg = stored_state["exp_avg"].view(-1,param.shape[-2],param.shape[-1])
-                exp_avg_sq = stored_state["exp_avg_sq"].view(-1,param.shape[-2],param.shape[-1])
-                param_view=param.data.view(-1,param.shape[-2],param.shape[-1])
-                assert(isinstance(param.grad,CompactedTensor),"expecting CompactedTensor grad")
-                sparse_adam_update(param_view, param.grad.compacted_values, exp_avg, exp_avg_sq, visible_chunk,visible_chunks_num, lr, 0.9, 0.999, eps)
-            else:
-                stored_state = self.state.get(param, None)
-                exp_avg = stored_state["exp_avg"]
-                exp_avg_sq = stored_state["exp_avg_sq"]
-                N=param.shape[-1]
-                sparse_adam_update(param.view(-1,N), param.grad.view(-1,N), exp_avg.view(-1,N), exp_avg_sq.view(-1,N), primitive_visible,None, lr, 0.9, 0.999, eps)
+
+            stored_state = self.state.get(param, None)
+            exp_avg = stored_state["exp_avg"].view(-1,param.shape[-2],param.shape[-1])
+            exp_avg_sq = stored_state["exp_avg_sq"].view(-1,param.shape[-2],param.shape[-1])
+            param_view=param.data.view(-1,param.shape[-2],param.shape[-1])
+            sparse_adam_update(param_view, param.grad._values().reshape(param_view.shape[0],visible_chunk.shape[0],param_view.shape[-1]), exp_avg, exp_avg_sq, visible_chunk, lr, 0.9, 0.999, eps)
 
 class Scheduler(_LRScheduler):
     def __init__(self, optimizer:torch.optim.Adam,lr_init, lr_final,max_epochs=10000, last_epoch=-1):
@@ -79,13 +70,13 @@ def get_optimizer(xyz:torch.nn.Parameter,scale:torch.nn.Parameter,rot:torch.nn.P
     l = [
         {'params': [xyz], 'lr': opt_setting.position_lr_init * spatial_lr_scale, "name": "xyz"},
         {'params': [sh_0], 'lr': opt_setting.feature_lr, "name": "sh_0"},
-        {'params': [sh_rest], 'lr': opt_setting.feature_lr / 10.0, "name": "sh_rest"},
+        {'params': [sh_rest], 'lr': opt_setting.feature_lr / 20.0, "name": "sh_rest"},
         {'params': [opacity], 'lr': opt_setting.opacity_lr, "name": "opacity"},
         {'params': [scale], 'lr': opt_setting.scaling_lr, "name": "scale"},
         {'params': [rot], 'lr': opt_setting.rotation_lr, "name": "rot"}
     ]
-    if pipeline_setting.sparse_grad:
-        optimizer = SparseGaussianAdam(l, lr=0, eps=1e-15,bCluster=pipeline_setting.cluster_size>0)
+    if pipeline_setting.cluster_size and pipeline_setting.sparse_grad:
+        optimizer = SparseGaussianAdam(l, lr=0, eps=1e-15)
     else:
         optimizer = torch.optim.Adam(l, lr=0, eps=1e-15)
     scheduler = Scheduler(optimizer,opt_setting.position_lr_init*spatial_lr_scale,

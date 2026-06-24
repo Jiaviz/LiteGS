@@ -5,7 +5,7 @@ import numpy as np
 import numpy.typing as npt
 from plyfile import PlyData, PlyElement
 
-from ..data import ImageFrame,PinHoleCameraInfo,CameraInfo
+from ..data import CameraFrame,PinHoleCameraInfo,CameraInfo
 
 
 WARNED = False
@@ -166,7 +166,7 @@ def __read_extrinsics_text(path):
     return images
 
 
-def load_frames(path:str,image_dir:str)->tuple[dict[int,PinHoleCameraInfo],list[ImageFrame]]:
+def load_frames(path:str,image_dir:str)->tuple[dict[int,PinHoleCameraInfo],list[CameraFrame]]:
     try:
         cameras_extrinsic_file = os.path.join(path, "sparse","0", "images.bin")
         cameras_intrinsic_file = os.path.join(path, "sparse","0", "cameras.bin")
@@ -179,7 +179,8 @@ def load_frames(path:str,image_dir:str)->tuple[dict[int,PinHoleCameraInfo],list[
         cam_intrinsics = __read_intrinsics_text(cameras_intrinsic_file)
 
     CameraInfoDict:dict[int,PinHoleCameraInfo]={}
-    ImageFrameList:list[ImageFrame]=[]
+    CameraFrameList:list[CameraFrame]=[]
+    missing_image_paths:list[str]=[]
 
     for CameraArg in cam_intrinsics.values():
         if(CameraArg.model=="PINHOLE"):
@@ -187,11 +188,23 @@ def load_frames(path:str,image_dir:str)->tuple[dict[int,PinHoleCameraInfo],list[
 
     for ImgArg in cam_extrinsics.values():
         if ImgArg.camera_id in CameraInfoDict.keys():
-            camera_frame=ImageFrame(ImgArg.id,ImgArg.viewtransform_rotation,ImgArg.tvec,ImgArg.camera_id,ImgArg.name,os.path.join(path,image_dir,ImgArg.name),ImgArg.xys)
-            ImageFrameList.append(camera_frame)
-    ImageFrameListSorted = sorted(ImageFrameList.copy(), key = lambda x : x.name)
+            image_path = os.path.join(path, image_dir, ImgArg.name)
+            if not os.path.exists(image_path):
+                missing_image_paths.append(image_path)
+                continue
+            camera_frame=CameraFrame(ImgArg.id,ImgArg.viewtransform_rotation,ImgArg.tvec,ImgArg.camera_id,ImgArg.name,image_path,ImgArg.xys)
+            CameraFrameList.append(camera_frame)
 
-    return CameraInfoDict,ImageFrameListSorted
+    if missing_image_paths:
+        print(f"[LiteGS] Skipping {len(missing_image_paths)} COLMAP frames with missing images under {os.path.join(path, image_dir)}.")
+        preview_count = min(3, len(missing_image_paths))
+        for missing_path in missing_image_paths[:preview_count]:
+            print(f"[LiteGS] Missing image: {missing_path}")
+        if len(missing_image_paths) > preview_count:
+            print(f"[LiteGS] ... and {len(missing_image_paths) - preview_count} more missing images.")
+    CameraFrameListSorted = sorted(CameraFrameList.copy(), key = lambda x : x.name)
+
+    return CameraInfoDict,CameraFrameListSorted
 
 
 def __read_next_bytes(fid, num_bytes, format_char_sequence, endian_character="<"):
@@ -319,7 +332,7 @@ def load_pointcloud(path:str):
 
     return __fetchPly(ply_path)
 
-def load_colmap_result(path:str,image_dir:str)->tuple[dict[int,PinHoleCameraInfo],list[ImageFrame],npt.NDArray,npt.NDArray]:
+def load_colmap_result(path:str,image_dir:str)->tuple[dict[int,PinHoleCameraInfo],list[CameraFrame],npt.NDArray,npt.NDArray]:
     cameras,frames=load_frames(path,image_dir)
     xyz,rgb=load_pointcloud(path)
     return cameras,frames,xyz,rgb

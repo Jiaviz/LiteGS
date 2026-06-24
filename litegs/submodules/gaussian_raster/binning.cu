@@ -1,17 +1,3 @@
-/*
-Portions of this code are derived from the project "speedy-splat"
-(https://github.com/j-alex-hanson/speedy-splat), which is based on
-"gaussian-splatting" developed by Inria and the Max Planck Institute for Informatik (MPII).
-
-Original work © Inria and MPII.
-Licensed under the Gaussian-Splatting License.
-You may use, reproduce, and distribute this work and its derivatives for
-**non-commercial research and evaluation purposes only**, subject to the terms
-and conditions of the Gaussian-Splatting License.
-
-A copy of the Gaussian-Splatting License is provided in the LICENSE file.
-*/
-
 #ifndef __CUDACC__
     #define __CUDACC__
     #define __NVCC__
@@ -20,208 +6,133 @@ A copy of the Gaussian-Splatting License is provided in the LICENSE file.
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 #include <cuda/atomic>
-#include <cub/cub.cuh>
-#include <cub/device/device_radix_sort.cuh>
 namespace cg = cooperative_groups;
 
+#include <c10/cuda/CUDAException.h>
 #include <ATen/core/TensorAccessor.h>
 
 #include "cuda_errchk.h"
 #include "binning.h"
-#include "speedy_splat.cuh"
 
-template<int TileSizeY, int TileSizeX>
  __global__ void duplicate_with_keys_kernel(
-     const torch::PackedTensorAccessor32<float, 3, torch::RestrictPtrTraits> tensor_ndc,        //viewnum,4,pointnum
-     const torch::PackedTensorAccessor32<float, 4, torch::RestrictPtrTraits> tensor_inv_cov2d,  //viewnum,2,2,pointnum
-     const torch::PackedTensorAccessor32<float, 2, torch::RestrictPtrTraits> tensor_opacity,  //viewnum,pointnum
-     const torch::PackedTensorAccessor32<int32_t, 2, torch::RestrictPtrTraits> tensor_offset,        //viewnum,pointnum+1
-     const torch::PackedTensorAccessor32<int64_t, 2, torch::RestrictPtrTraits> depth_sorted_point_id,        //viewnum,pointnum
-     int img_h, int img_w, unsigned int tile_num_h, unsigned int tile_num_w,
-     torch::PackedTensorAccessor32 < int32_t, 2, torch::RestrictPtrTraits> tensor_key,//viewnum,allocated_size
-     torch::PackedTensorAccessor32 < int32_t, 2, torch::RestrictPtrTraits> tensor_value//viewnum,allocated_size
+    const torch::PackedTensorAccessor32<int32_t, 3,torch::RestrictPtrTraits> LU,//viewnum,2,pointnum
+    const torch::PackedTensorAccessor32<int32_t, 3,torch::RestrictPtrTraits> RD,//viewnum,2,pointnum
+    const torch::PackedTensorAccessor32<int32_t, 2,torch::RestrictPtrTraits> prefix_sum,//viewnum,pointnum
+     const torch::PackedTensorAccessor32<int64_t, 2, torch::RestrictPtrTraits> depth_sorted_pointid,//viewnum,pointnum
+    int TileSizeX,
+    torch::PackedTensorAccessor32 < int32_t, 2, torch::RestrictPtrTraits> table_tileId,
+     torch::PackedTensorAccessor32 < int32_t, 2, torch::RestrictPtrTraits> table_pointId
     )
 {
-     int view_id = blockIdx.y;
-     int index = blockIdx.x * blockDim.x + threadIdx.x;
-     if (index < tensor_ndc.size(2))
-     {
-         int buffer_offset = index == 0 ? 0 : tensor_offset[view_id][index - 1];
-         int allocated_size = tensor_offset[view_id][index] - buffer_offset;
-         index = depth_sorted_point_id[view_id][index];
+    int view_id = blockIdx.y;
+    
 
-         float4 ndc{ tensor_ndc[view_id][0][index],tensor_ndc[view_id][1][index],
-             tensor_ndc[view_id][2][index] ,tensor_ndc[view_id][3][index] };
-         float opacity = tensor_opacity[view_id][index];
-         float4 con_o{ tensor_inv_cov2d[view_id][0][0][index],tensor_inv_cov2d[view_id][0][1][index],tensor_inv_cov2d[view_id][1][1][index],opacity };
-         float disc = con_o.y * con_o.y - con_o.x * con_o.z;
-         float2 screen_uv{ ndc.x * 0.5f + 0.5f,ndc.y * 0.5f + 0.5f };
-         float2 p{ screen_uv.x * img_w - 0.5f,screen_uv.y * img_h - 0.5f };
-         const dim3 grid{ tile_num_w,tile_num_h,0 };
+    if (blockIdx.x * blockDim.x + threadIdx.x < prefix_sum.size(1))
+    {
+        int point_id = depth_sorted_pointid[view_id][blockIdx.x * blockDim.x + threadIdx.x];
+        int end = prefix_sum[view_id][blockIdx.x * blockDim.x + threadIdx.x];
 
-
-         if ((allocated_size>0)&&(buffer_offset+allocated_size<=tensor_key.size(1)))
-         {
-             float t = 2.0f * log(con_o.w * 255.0f);
-             float x_term = sqrt(-(con_o.y * con_o.y * t) / (disc * con_o.x));
-             x_term = (con_o.y < 0) ? x_term : -x_term;
-             float y_term = sqrt(-(con_o.y * con_o.y * t) / (disc * con_o.z));
-             y_term = (con_o.y < 0) ? y_term : -y_term;
-
-             float2 bbox_argmin = { p.y - y_term, p.x - x_term };
-             float2 bbox_argmax = { p.y + y_term, p.x + x_term };
-
-             float2 bbox_min = {
-                 computeEllipseIntersection(con_o, disc, t, p, true, bbox_argmin.x).x,
-                 computeEllipseIntersection(con_o, disc, t, p, false, bbox_argmin.y).x
-             };
-             float2 bbox_max = {
-                 computeEllipseIntersection(con_o, disc, t, p, true, bbox_argmax.x).y,
-                 computeEllipseIntersection(con_o, disc, t, p, false, bbox_argmax.y).y
-             };
-
-             // Rectangular tile extent of ellipse
-             int2 rect_min = {
-                 max(0, min((int)grid.x, (int)(bbox_min.x / TileSizeX))),
-                 max(0, min((int)grid.y, (int)(bbox_min.y / TileSizeY)))
-             };
-             int2 rect_max = {
-                 max(0, min((int)grid.x, (int)((bbox_max.x + TileSizeX - 1) / TileSizeX))),
-                 max(0, min((int)grid.y, (int)((bbox_max.y + TileSizeY - 1) / TileSizeY)))
-             };
-
-             int y_span = rect_max.y - rect_min.y;
-             int x_span = rect_max.x - rect_min.x;
-             if (y_span * x_span > 0)
-             {
-                 bool isY = y_span < x_span;
-                 processTiles<TileSizeY, TileSizeX>(
-                     con_o, disc, t, p,
-                     bbox_min, bbox_max,
-                     bbox_argmin, bbox_argmax,
-                     rect_min, rect_max,
-                     grid, isY,
-                     index, buffer_offset,
-                     &tensor_key[view_id][0],
-                     &tensor_value[view_id][0]);
-             }
-         }
-     }
+        //int end = prefix_sum[view_id][point_id+1];
+        int l = LU[view_id][0][point_id];
+        int u = LU[view_id][1][point_id];
+        int r = RD[view_id][0][point_id];
+        int d = RD[view_id][1][point_id];
+        int count = 0;
+        if ((r - l) * (d - u) < 32)
+        {
+            for (int i = u; i < d; i++)
+            {
+                for (int j = l; j < r; j++)
+                {
+                    int tile_id = i * TileSizeX + j;
+                    table_tileId[view_id][end - 1 - count] = tile_id + 1;// tile_id 0 means invalid!
+                    table_pointId[view_id][end - 1 - count] = point_id;
+                    count++;
+                }
+            }
+        }
+    }
 }
 
-#define LAUNCH_DUPLICATE_WITH_KEYS_KERNEL(TILE_SIZE_H, TILE_SIZE_W)                     \
-    duplicate_with_keys_kernel<TILE_SIZE_H, TILE_SIZE_W><<<Block3d,256>>>(              \
-        ndc.packed_accessor32<float, 3, torch::RestrictPtrTraits>(),                    \
-        inv_cov2d.packed_accessor32<float, 4, torch::RestrictPtrTraits>(),              \
-        opacity.packed_accessor32<float, 2, torch::RestrictPtrTraits>(),                \
-        offset.packed_accessor32<int32_t, 2, torch::RestrictPtrTraits>(),               \
-        depth_sorted_pointid.packed_accessor32<int64_t, 2, torch::RestrictPtrTraits>(), \
-        height,width, tiles_num_h, tiles_num_w,                                         \
-        table_tileId.packed_accessor32<int32_t, 2, torch::RestrictPtrTraits>(),         \
-        table_pointId.packed_accessor32<int32_t, 2, torch::RestrictPtrTraits>());
+ __global__ void large_points_duplicate_with_keys_kernel(
+     const torch::PackedTensorAccessor32<int32_t, 3, torch::RestrictPtrTraits> LU,//viewnum,2,pointnum
+     const torch::PackedTensorAccessor32<int32_t, 3, torch::RestrictPtrTraits> RD,//viewnum,2,pointnum
+     const torch::PackedTensorAccessor32<int32_t, 2, torch::RestrictPtrTraits> prefix_sum,//viewnum,pointnum
+     const torch::PackedTensorAccessor32<int64_t, 2, torch::RestrictPtrTraits> depth_sorted_pointid,//viewnum,pointnum
+     const torch::PackedTensorAccessor32<int64_t, 2, torch::RestrictPtrTraits> large_index,//tasknum,2
+     int TileSizeX,
+     torch::PackedTensorAccessor32 < int32_t, 2, torch::RestrictPtrTraits> table_tileId,
+     torch::PackedTensorAccessor32 < int32_t, 2, torch::RestrictPtrTraits> table_pointId
+ )
+ {
+     auto block = cg::this_thread_block();
+     auto warp = cg::tiled_partition<32>(block);
+     int task_index = warp.meta_group_size() * block.group_index().x + warp.meta_group_rank();
 
- std::vector<at::Tensor> create_table(
-     at::Tensor ndc, at::Tensor inv_cov2d, at::Tensor opacity, at::Tensor offset, at::Tensor depth_sorted_pointid,
-     std::optional<at::Tensor> feedback_buffer_arg, std::optional<at::Tensor> data_idx_arg,
-     int64_t height, int64_t width, int64_t tile_size_h, int64_t tile_size_w)
+     if (task_index < large_index.size(0))
+     {
+         int view_id = large_index[task_index][0];
+         int point_index = large_index[task_index][1];
+         int point_id = depth_sorted_pointid[view_id][point_index];
+         int end = prefix_sum[view_id][point_index];
+
+         //int end = prefix_sum[view_id][point_id+1];
+         int l = LU[view_id][0][point_id];
+         int u = LU[view_id][1][point_id];
+         int width = RD[view_id][0][point_id]-l;
+         int height = RD[view_id][1][point_id]-u;
+         for (int i = warp.thread_rank(); i < width * height; i+=warp.num_threads())
+         {
+             int col = l + (i % width);
+             int row = u + (i / width);
+             int tile_id = row * TileSizeX + col;
+             table_tileId[view_id][end - 1 - i] = tile_id + 1;// tile_id 0 means invalid!
+             table_pointId[view_id][end - 1 - i] = point_id;
+         }
+     }
+ }
+
+std::vector<at::Tensor> duplicateWithKeys(at::Tensor LU, at::Tensor RD, at::Tensor prefix_sum, at::Tensor depth_sorted_pointid,
+    at::Tensor large_index,int64_t allocate_size, int64_t TilesSizeX)
 {
-    // assert(tile_size_h == 8 && tile_size_w == 16);
-    int tiles_num_h = (height + tile_size_h - 1) / tile_size_h;
-    int tiles_num_w = (width + tile_size_w - 1) / tile_size_w;
+    at::DeviceGuard guard(LU.device());
+    int64_t view_num = LU.sizes()[0];
+    int64_t points_num = LU.sizes()[2];
 
+    std::vector<int64_t> output_shape{ view_num, allocate_size };
 
-    at::DeviceGuard guard(inv_cov2d.device());
-    int64_t view_num = ndc.sizes()[0];
-    int64_t points_num = ndc.sizes()[2];
-
-    int pred_allocate_size = 0;
-    if (feedback_buffer_arg.has_value() && data_idx_arg.has_value())
-    {
-        int* feedback_buffer = (*feedback_buffer_arg).data_ptr<int>();
-        for (int i = 0; i < view_num; i++)
-        {
-            int idx = (*data_idx_arg)[i].item().toInt();
-            if (feedback_buffer[idx] > pred_allocate_size)
-            {
-                pred_allocate_size = feedback_buffer[idx];
-            }
-            cudaMemcpyAsync(&feedback_buffer[idx], offset.data_ptr<int>() + (i * points_num) + (points_num - 1), sizeof(int), cudaMemcpyDeviceToHost);
-        }
-    }
-    pred_allocate_size = 1.5f * pred_allocate_size;
-    if (pred_allocate_size <= 0)//sync
-    {
-        int temp = 0;
-        for (int i = 0; i < view_num; i++)
-        {
-            cudaMemcpy(&temp, offset.data_ptr<int>() + (i * points_num) + (points_num - 1), sizeof(int), cudaMemcpyDeviceToHost);
-        }
-        if (temp > pred_allocate_size)
-        {
-            pred_allocate_size = temp;
-        }
-    }
-    TORCH_CHECK(pred_allocate_size > 0, "error pred_allocate_size\n");
-    /*if (pred_allocate_size <= 0 || pred_allocate_size > 10 * 1024 * 1024)
-    {
-        printf("error %d\n",pred_allocate_size);
-    }*/
-    CUDA_CHECK_ERRORS;
-
-    std::vector<int64_t> output_shape{ view_num, pred_allocate_size };
-    auto opt = torch::TensorOptions().dtype(torch::kInt32).layout(torch::kStrided).device(ndc.device()).requires_grad(false);
+    auto opt = torch::TensorOptions().dtype(torch::kInt32).layout(torch::kStrided).device(LU.device()).requires_grad(false);
     auto table_tileId = torch::zeros(output_shape, opt);
-    auto table_tileId_sorted = torch::empty(output_shape, opt);
-    opt = torch::TensorOptions().dtype(torch::kInt32).layout(torch::kStrided).device(ndc.device()).requires_grad(false);
-    auto table_pointId= torch::empty(output_shape, opt);
-    auto table_pointId_sorted = torch::empty(output_shape, opt);
+    opt = torch::TensorOptions().dtype(torch::kInt32).layout(torch::kStrided).device(LU.device()).requires_grad(false);
+    auto table_pointId= torch::zeros(output_shape, opt);
 
-    dim3 Block3d(std::ceil(points_num/256.0f), view_num, 1);
+    dim3 Block3d(std::ceil(points_num/1024.0f), view_num, 1);
     
-    if (tile_size_h == 8 && tile_size_w == 16)
-    {
-        LAUNCH_DUPLICATE_WITH_KEYS_KERNEL(8,16);
-    }
-    else if (tile_size_h == 12 && tile_size_w == 16)
-    {
-        LAUNCH_DUPLICATE_WITH_KEYS_KERNEL(12, 16);
-    }
-    else if (tile_size_h == 16 && tile_size_w == 16)
-    {
-        LAUNCH_DUPLICATE_WITH_KEYS_KERNEL(16,16);
-    }
-    else if (tile_size_h == 8 && tile_size_w == 8)
-    {
-        LAUNCH_DUPLICATE_WITH_KEYS_KERNEL(8,8);
-    }
+
+    duplicate_with_keys_kernel<<<Block3d ,1024>>>(
+        LU.packed_accessor32<int32_t, 3, torch::RestrictPtrTraits>(),
+        RD.packed_accessor32<int32_t, 3, torch::RestrictPtrTraits>(),
+        prefix_sum.packed_accessor32<int32_t, 2, torch::RestrictPtrTraits>(),
+        depth_sorted_pointid.packed_accessor32<int64_t, 2, torch::RestrictPtrTraits>(),
+        TilesSizeX,
+        table_tileId.packed_accessor32<int32_t, 2, torch::RestrictPtrTraits>(),
+        table_pointId.packed_accessor32<int32_t, 2, torch::RestrictPtrTraits>());
+    CUDA_CHECK_ERRORS;
+    
+    int large_points_num = large_index.size(0);
+    int blocksnum = std::ceil((large_points_num * 32) / 1024.0f);
+    large_points_duplicate_with_keys_kernel << <blocksnum, 1024 >> > (
+        LU.packed_accessor32<int32_t, 3, torch::RestrictPtrTraits>(),
+        RD.packed_accessor32<int32_t, 3, torch::RestrictPtrTraits>(),
+        prefix_sum.packed_accessor32<int32_t, 2, torch::RestrictPtrTraits>(),
+        depth_sorted_pointid.packed_accessor32<int64_t, 2, torch::RestrictPtrTraits>(),
+        large_index.packed_accessor32<int64_t, 2, torch::RestrictPtrTraits>(),
+        TilesSizeX,
+        table_tileId.packed_accessor32<int32_t, 2, torch::RestrictPtrTraits>(),
+        table_pointId.packed_accessor32<int32_t, 2, torch::RestrictPtrTraits>());
     CUDA_CHECK_ERRORS;
 
-    unsigned int bit = 0;
-    unsigned int max_tiles = tiles_num_h * tiles_num_w;
-    while (max_tiles >>= 1) bit++;
-    bit++;
-
-    size_t sort_tmp_buffer_size;
-    cub::DeviceRadixSort::SortPairs<int,int>(
-        nullptr,
-        sort_tmp_buffer_size,
-        (int*)table_tileId.data_ptr(), (int*)table_tileId_sorted.data_ptr(),
-        (int*)table_pointId.data_ptr(), (int*)table_pointId_sorted.data_ptr(),
-        pred_allocate_size, 0, bit);
-    auto temp_buffer_tensor=torch::empty({ ((int)sort_tmp_buffer_size + 4 - 1) / 4 }, opt);
-    
-    for (int view_id = 0; view_id < view_num; view_id++)
-    {
-        cub::DeviceRadixSort::SortPairs(
-            temp_buffer_tensor.data_ptr(),
-            sort_tmp_buffer_size,
-            (int*)table_tileId.data_ptr(), (int*)table_tileId_sorted.data_ptr(),
-            (int*)table_pointId.data_ptr(), (int*)table_pointId_sorted.data_ptr(),
-            pred_allocate_size, 0, bit);
-    }
-    CUDA_CHECK_ERRORS;
-
-    return { table_tileId_sorted ,table_pointId_sorted };
+    return { table_tileId ,table_pointId };
     
 }
 
@@ -264,177 +175,104 @@ __global__ void tile_range_kernel(
     }
 }
 
-at::Tensor tileRange(at::Tensor table_tileId, int64_t max_tileId)
+at::Tensor tileRange(at::Tensor table_tileId, int64_t table_length, int64_t max_tileId)
 {
     at::DeviceGuard guard(table_tileId.device());
 
-    int64_t view_num = table_tileId.size(0);
-    int64_t table_length = table_tileId.size(1);
-    std::vector<int64_t> output_shape{ view_num, max_tileId + 2 };//out[max_tileId]:start offset out[mat_tileId+1]:end_offset
+    int64_t view_num = table_tileId.sizes()[0];
+    std::vector<int64_t> output_shape{ view_num,max_tileId + 1 + 1 };//+1 for tail
     //printf("\ntensor shape in tileRange:%ld,%ld\n", view_num, max_tileId+1-1);
     auto opt = torch::TensorOptions().dtype(torch::kInt32).layout(torch::kStrided).device(table_tileId.device()).requires_grad(false);
     auto out = torch::ones(output_shape, opt)*-1;
 
-    dim3 Block3d(std::ceil(table_length / 512.0f), view_num, 1);
-    //if(std::ceil(table_length / 512.0f)<=0|| std::ceil(table_length / 512.0f)>=65536||view_num<=0||view_num>=65536)
-    //    printf("table_length %d\n", table_length);
+    dim3 Block3d(std::ceil(table_length / 1024.0f), view_num, 1);
 
-    tile_range_kernel<<<Block3d, 512 >>>
+    tile_range_kernel<<<Block3d, 1024 >>>
         (table_tileId.packed_accessor32<int32_t, 2, torch::RestrictPtrTraits>(), table_length, max_tileId, out.packed_accessor32<int32_t, 2, torch::RestrictPtrTraits>());
     CUDA_CHECK_ERRORS;
 
     return out;
 }
 
-template<int TileSizeY, int TileSizeX>
-__global__ void get_allocate_size_kernel(
+__global__ void create_ROI_AABB_kernel(
     const torch::PackedTensorAccessor32<float, 3, torch::RestrictPtrTraits> tensor_ndc,        //viewnum,4,pointnum
-    const torch::PackedTensorAccessor32<float, 2, torch::RestrictPtrTraits> view_space_z,        //viewnum,pointnum
-    const torch::PackedTensorAccessor32<float, 4, torch::RestrictPtrTraits> tensor_inv_cov2d,  //viewnum,2,2,pointnum
+    const torch::PackedTensorAccessor32<float, 3, torch::RestrictPtrTraits> tensor_eigen_val,  //viewnum,2,pointnum
+    const torch::PackedTensorAccessor32<float, 4, torch::RestrictPtrTraits> tensor_eigen_vec,  //viewnum,2,2,pointnum
     const torch::PackedTensorAccessor32<float, 2, torch::RestrictPtrTraits> tensor_opacity,  //viewnum,pointnum
-    const int* __restrict__ valid_length,
-    int img_h, int img_w, unsigned int tile_num_h, unsigned int tile_num_w,
-    torch::PackedTensorAccessor32 < int32_t, 3, torch::RestrictPtrTraits> tensor_left_up,//viewnum,2,pointnum
-    torch::PackedTensorAccessor32 < int32_t, 3, torch::RestrictPtrTraits> tensor_right_down,//viewnum,2,pointnum
-    torch::PackedTensorAccessor32 < int32_t, 2, torch::RestrictPtrTraits> tensor_allocated_size//viewnum,pointnum
+    int img_h,int img_w,int img_tile_h,int img_tile_w,int tilesize,
+    torch::PackedTensorAccessor32 < int32_t, 3, torch::RestrictPtrTraits> tensor_left_up,
+    torch::PackedTensorAccessor32 < int32_t, 3, torch::RestrictPtrTraits> tensor_right_down
 )
 {
-    //speedy splat https://github.com/j-alex-hanson/speedy-splat
-
     int view_id = blockIdx.y;
     int index = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (index >= tensor_ndc.size(2) || (valid_length != nullptr && index >= valid_length[0]))
-        return;
-
-    float4 ndc{ tensor_ndc[view_id][0][index],tensor_ndc[view_id][1][index],
-        tensor_ndc[view_id][2][index] ,tensor_ndc[view_id][3][index] };
-    float opacity = tensor_opacity[view_id][index];
-    float4 con_o{ tensor_inv_cov2d[view_id][0][0][index],tensor_inv_cov2d[view_id][0][1][index],tensor_inv_cov2d[view_id][1][1][index],opacity };
-    float disc = con_o.y * con_o.y - con_o.x * con_o.z;
-    float2 screen_uv{ ndc.x * 0.5f + 0.5f,ndc.y * 0.5f + 0.5f };
-    float2 p{ screen_uv.x * img_w - 0.5f,screen_uv.y * img_h - 0.5f };
-    const dim3 grid{ tile_num_w,tile_num_h,0 };
-
-    bool bVisible = !((ndc.x < -1.3f) || (ndc.x > 1.3f) || (ndc.y < -1.3f) || (ndc.y > 1.3f) || (view_space_z[view_id][index] <= 0.2f) || (con_o.w < 1.0f / 255));
-    bVisible &= ((con_o.x > 0)& (con_o.z > 0)& (disc < 0));
-
-    if (bVisible)
+    if (index < tensor_ndc.size(2))
     {
-        float t = 2.0f * log(con_o.w * 255.0f);
-        float x_term = sqrt(-(con_o.y * con_o.y * t) / (disc * con_o.x));
-        x_term = (con_o.y < 0) ? x_term : -x_term;
-        float y_term = sqrt(-(con_o.y * con_o.y * t) / (disc * con_o.z));
-        y_term = (con_o.y < 0) ? y_term : -y_term;
-
-        float2 bbox_argmin = { p.y - y_term, p.x - x_term };
-        float2 bbox_argmax = { p.y + y_term, p.x + x_term };
-            
-        float2 bbox_min = {
-            computeEllipseIntersection(con_o, disc, t, p, true, bbox_argmin.x).x,
-            computeEllipseIntersection(con_o, disc, t, p, false, bbox_argmin.y).x
-        };
-        float2 bbox_max = {
-            computeEllipseIntersection(con_o, disc, t, p, true, bbox_argmax.x).y,
-            computeEllipseIntersection(con_o, disc, t, p, false, bbox_argmax.y).y
-        };
-
-        tensor_left_up[view_id][0][index] = std::ceil(bbox_min.x);
-        tensor_left_up[view_id][1][index] = std::ceil(bbox_min.y);
-        tensor_right_down[view_id][0][index] = std::floor(bbox_max.x);
-        tensor_right_down[view_id][1][index] = std::floor(bbox_max.y);
-
-        // Rectangular tile extent of ellipse
-        int2 rect_min = {
-            max(0, min((int)grid.x, (int)(bbox_min.x / TileSizeX))),
-            max(0, min((int)grid.y, (int)(bbox_min.y / TileSizeY)))
-        };
-        int2 rect_max = {
-            max(0, min((int)grid.x, (int)((bbox_max.x + TileSizeX - 1) / TileSizeX))),
-            max(0, min((int)grid.y, (int)((bbox_max.y + TileSizeY - 1) / TileSizeY)))
-        };
-
-        int y_span = rect_max.y - rect_min.y;
-        int x_span = rect_max.x - rect_min.x;
-        int allocated_size = 0;
-        if (y_span * x_span > 0)
+        float4 ndc{ tensor_ndc[view_id][0][index],tensor_ndc[view_id][1][index],
+            tensor_ndc[view_id][2][index] ,tensor_ndc[view_id][3][index] };
+        bool bVisible = !((ndc.x < -1.3f) || (ndc.x > 1.3f) || (ndc.y < -1.3f) || (ndc.y > 1.3f) || (ndc.z > 1.0f) || (ndc.z < 0.0f));
+        if (bVisible)
         {
-            bool isY = y_span < x_span;
-            allocated_size = processTiles<TileSizeY, TileSizeX>(
-                con_o, disc, t, p,
-                bbox_min, bbox_max,
-                bbox_argmin, bbox_argmax,
-                rect_min, rect_max,
-                grid, isY,
-                index, 0,
-                nullptr,
-                nullptr);
+            float opacity = max(tensor_opacity[view_id][index], 1.0f / 255);
+            float coefficient = 2 * log(255 * opacity);
+            float axis_length[2]{ 0,0 };
+            axis_length[0] = sqrt(coefficient * tensor_eigen_val[view_id][0][index]);
+            axis_length[1] = sqrt(coefficient * tensor_eigen_val[view_id][1][index]);
+            float2 axis_dir[2];
+            axis_dir[0].x = tensor_eigen_vec[view_id][0][0][index];
+            axis_dir[0].y = tensor_eigen_vec[view_id][0][1][index];
+            axis_dir[1].x = tensor_eigen_vec[view_id][1][0][index];
+            axis_dir[1].y = tensor_eigen_vec[view_id][1][1][index];
+            float2 axis[2];
+            axis[0].x = axis_dir[0].x * axis_length[0];
+            axis[0].y = axis_dir[0].y * axis_length[0];
+            axis[1].x = axis_dir[1].x * axis_length[1];
+            axis[1].y = axis_dir[1].y * axis_length[1];
+
+            float2 screen_uv{ ndc.x * 0.5f + 0.5f,ndc.y * 0.5f + 0.5f };
+            float2 coord{ screen_uv.x * img_w - 0.5f,screen_uv.y * img_h - 0.5f };
+            float min_x = coord.x - abs(axis[0].x) - abs(axis[1].x);
+            float max_x = coord.x + abs(axis[0].x) + abs(axis[1].x);
+            float min_y = coord.y - abs(axis[0].y) - abs(axis[1].y);
+            float max_y = coord.y + abs(axis[0].y) + abs(axis[1].y);
+            int2 left_up{ min_x / tilesize,min_y / tilesize };
+            int2 right_down{ ceil(max_x / tilesize),ceil(max_y / tilesize) };
+            tensor_left_up[view_id][0][index] = min(max(left_up.x,0), img_tile_w);
+            tensor_left_up[view_id][1][index] = min(max(left_up.y,0),img_tile_h);
+            tensor_right_down[view_id][0][index] = min(max(right_down.x,0), img_tile_w);
+            tensor_right_down[view_id][1][index] = min(max(right_down.y,0), img_tile_h);
         }
-        tensor_allocated_size[view_id][index] = allocated_size;
-              
+        else
+        {
+            tensor_left_up[view_id][0][index] = 0;
+            tensor_left_up[view_id][1][index] = 0;
+            tensor_right_down[view_id][0][index] = 0;
+            tensor_right_down[view_id][1][index] = 0;
+        }
     }
-    else
-    {
-        tensor_left_up[view_id][0][index] = -1;
-        tensor_left_up[view_id][1][index] = -1;
-        tensor_right_down[view_id][0][index] = -1;
-        tensor_right_down[view_id][1][index] = -1;
-        tensor_allocated_size[view_id][index] = 0;
-    }
-    
 }
 
-#define LAUNCH_GET_ALLOCATE_SIZE_KERNEL(TILE_SIZE_H, TILE_SIZE_W)                                                \
-    get_allocate_size_kernel<TILE_SIZE_H, TILE_SIZE_W><<<Block3d,256>>>(ndc.packed_accessor32<float, 3, torch::RestrictPtrTraits>(), \
-    view_space_z.packed_accessor32<float, 2, torch::RestrictPtrTraits>(),                                        \
-    inv_cov2d.packed_accessor32<float, 4, torch::RestrictPtrTraits>(),                                           \
-    opacity.packed_accessor32<float, 2, torch::RestrictPtrTraits>(),                                             \
-    p_valid_length,                                                                                              \
-    height, width,tiles_num_h, tiles_num_w,                                                                      \
-    left_up.packed_accessor32<int32_t, 3, torch::RestrictPtrTraits>(),                                           \
-    right_down.packed_accessor32<int32_t, 3, torch::RestrictPtrTraits>(),                                        \
-    allocated_size.packed_accessor32<int32_t, 2, torch::RestrictPtrTraits>());
-
-std::vector<at::Tensor> get_allocate_size(
-    at::Tensor ndc, at::Tensor view_space_z, at::Tensor inv_cov2d, at::Tensor opacity,
-    int64_t height,int64_t width, int64_t tile_size_h, int64_t tile_size_w,
-    std::optional<at::Tensor> valid_length
-)
+std::vector<at::Tensor> create_ROI_AABB(at::Tensor ndc, at::Tensor eigen_val, at::Tensor eigen_vec, at::Tensor opacity,
+    int64_t height,int64_t width, int64_t tilesize)
 {
     at::DeviceGuard guard(ndc.device());
-
-    // assert(tile_size_h == 8 && tile_size_w == 16);
-    int tiles_num_h = (height + tile_size_h - 1) / tile_size_h;
-    int tiles_num_w = (width + tile_size_w - 1) / tile_size_w;
 
     int views_num = ndc.size(0);
     int points_num = ndc.size(2);
     at::Tensor left_up = torch::empty({ views_num,2,points_num }, ndc.options().dtype(torch::kInt32));
     at::Tensor right_down = torch::empty({ views_num,2,points_num }, ndc.options().dtype(torch::kInt32));
-    at::Tensor allocated_size = torch::zeros({ views_num,points_num }, ndc.options().dtype(torch::kInt32));
-    int* p_valid_length = nullptr;
-    if (valid_length.has_value())
-    {
-        p_valid_length = (*valid_length).data_ptr<int>();
-    }
 
     dim3 Block3d(std::ceil(points_num / 256.0f), views_num, 1);
-    if (tile_size_h == 8 && tile_size_w == 16)
-    {
-        LAUNCH_GET_ALLOCATE_SIZE_KERNEL(8,16);
-    }
-    else if (tile_size_h == 12 && tile_size_w == 16)
-    {
-        LAUNCH_GET_ALLOCATE_SIZE_KERNEL(12, 16);
-    }
-    else if (tile_size_h == 16 && tile_size_w == 16)
-    {
-        LAUNCH_GET_ALLOCATE_SIZE_KERNEL(16,16);
-    }
-    else if (tile_size_h == 8 && tile_size_w == 8)
-    {
-        LAUNCH_GET_ALLOCATE_SIZE_KERNEL(8,8);
-    }
+    create_ROI_AABB_kernel<<<Block3d,256>>>(ndc.packed_accessor32<float, 3, torch::RestrictPtrTraits>(),
+        eigen_val.packed_accessor32<float, 3, torch::RestrictPtrTraits>(),
+        eigen_vec.packed_accessor32<float, 4, torch::RestrictPtrTraits>(),
+        opacity.packed_accessor32<float, 2, torch::RestrictPtrTraits>(),
+        height, width,ceil(height/(float)tilesize), ceil(width / (float)tilesize), tilesize,
+        left_up.packed_accessor32<int32_t, 3, torch::RestrictPtrTraits>(),
+        right_down.packed_accessor32<int32_t, 3, torch::RestrictPtrTraits>()
+        );
     CUDA_CHECK_ERRORS;
-    return { left_up ,right_down,allocated_size };
+    return { left_up ,right_down };
 }
+
+

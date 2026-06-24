@@ -4,21 +4,20 @@ import fused_ssim
 from torchmetrics.image import psnr
 from tqdm import tqdm
 import numpy as np
-import math
 import os
 import torch.cuda.nvtx as nvtx
-import matplotlib.pyplot as plt
-import json
 
 from .. import arguments
 from .. import data
 from .. import io_manager
 from .. import scene
 from . import optimizer
+from ..data import CameraFrameDataset
 from .. import render
+from .optimizer import SparseGaussianAdam
+from ..utils import wrapper
 from ..utils.statistic_helper import StatisticsHelperInst
 from . import densify
-from .. import utils
 
 def __l1_loss(network_output:torch.Tensor, gt:torch.Tensor)->torch.Tensor:
     return torch.abs((network_output - gt)).mean()
@@ -32,7 +31,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
           test_epochs=[],save_ply=[],save_checkpoint=[],start_checkpoint:str=None):
     
     cameras_info:dict[int,data.CameraInfo]=None
-    camera_frames:list[data.ImageFrame]=None
+    camera_frames:list[data.CameraFrame]=None
     cameras_info,camera_frames,init_xyz,init_color=io_manager.load_colmap_result(lp.source_path,lp.images)#lp.sh_degree,lp.resolution
 
     #preload
@@ -41,14 +40,8 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
 
     #Dataset
     if lp.eval:
-        if os.path.exists(os.path.join(lp.source_path,"train_test_split.json")):
-            with open(os.path.join(lp.source_path,"train_test_split.json"), "r") as file:
-                train_test_split = json.load(file)
-                training_frames=[c for c in camera_frames if c.name in train_test_split["train"]]
-                test_frames=[c for c in camera_frames if c.name in train_test_split["test"]]
-        else:
-            training_frames=[c for idx, c in enumerate(camera_frames) if idx % 8 != 0]
-            test_frames=[c for idx, c in enumerate(camera_frames) if idx % 8 == 0]
+        training_frames=[c for idx, c in enumerate(camera_frames) if idx % 8 != 0]
+        test_frames=[c for idx, c in enumerate(camera_frames) if idx % 8 == 0]
     else:
         training_frames=camera_frames
         test_frames=None
@@ -58,14 +51,13 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
         pp.enable_transmitance=True
         dp.densify_until = 0
         print("[LiteGS] Disabling densification for masked object-centric training.")
-    trainingset=data.CameraFrameDataset(cameras_info,training_frames,lp.resolution,pp.device_preload,mask_root=mask_root)
+    trainingset=CameraFrameDataset(cameras_info,training_frames,lp.resolution,pp.device_preload,mask_root=mask_root)
     train_loader = DataLoader(trainingset, batch_size=1,shuffle=True,pin_memory=not pp.device_preload)
     test_loader=None
     if lp.eval:
-        testset=data.CameraFrameDataset(cameras_info,test_frames,lp.resolution,pp.device_preload,mask_root=mask_root)
-        test_loader = DataLoader(testset, batch_size=1,shuffle=False,pin_memory=not pp.device_preload)
+        testset=CameraFrameDataset(cameras_info,test_frames,lp.resolution,pp.device_preload,mask_root=mask_root)
+        test_loader = DataLoader(testset, batch_size=1,shuffle=True,pin_memory=not pp.device_preload)
     norm_trans,norm_radius=trainingset.get_norm()
-    frames_buffer=data.FramesBuffer(trainingset)
 
     #torch parameter
     cluster_origin=None
@@ -93,24 +85,15 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
         start_epoch=0
     else:
         xyz,scale,rot,sh_0,sh_rest,opacity,start_epoch,opt,schedular=io_manager.load_checkpoint(start_checkpoint)
-    if pp.cluster_size:
-        cluster_origin,cluster_extend=scene.cluster.get_cluster_AABB(xyz,scale.exp(),torch.nn.functional.normalize(rot,dim=0))
+        if pp.cluster_size:
+            cluster_origin,cluster_extend=scene.cluster.get_cluster_AABB(xyz,scale.exp(),torch.nn.functional.normalize(rot,dim=0))
     actived_sh_degree=0
-
-    #learnable view matrix
-    if op.learnable_viewproj:
-        noise_extr=torch.cat([frame.extr_params[None,:] for frame in trainingset.frames])
-        denoised_training_extr=torch.nn.Embedding(noise_extr.shape[0],noise_extr.shape[1],_weight=noise_extr.clone(),sparse=True)
-        noise_intr=torch.tensor(list(trainingset.cameras.values())[0].intr_params,dtype=torch.float32,device='cuda').unsqueeze(0)
-        denoised_training_intr=torch.nn.Parameter(torch.tensor(list(trainingset.cameras.values())[0].intr_params,dtype=torch.float32,device='cuda').unsqueeze(0))#todo fix multi cameras
-        view_opt=torch.optim.SparseAdam(denoised_training_extr.parameters(),lr=1e-4)
-        proj_opt=torch.optim.Adam([denoised_training_intr,],lr=1e-5)
 
     #init
     total_epoch=int(op.iterations/len(trainingset))
     if dp.densify_until<0:
-        dp.densify_until=int(total_epoch*0.8/dp.opacity_reset_interval)*dp.opacity_reset_interval+1
-    density_controller=densify.DensityControllerTamingGS(norm_radius,dp,pp.cluster_size>0,init_points_num)
+        dp.densify_until=int(int(total_epoch/2)/dp.opacity_reset_interval)*dp.opacity_reset_interval
+    density_controller=densify.DensityControllerOfficial(norm_radius,dp,pp.cluster_size>0)
     StatisticsHelperInst.reset(xyz.shape[-2],xyz.shape[-1],density_controller.is_densify_actived)
     progress_bar = tqdm(range(start_epoch, total_epoch), desc="Training progress")
     progress_bar.update(0)
@@ -118,111 +101,69 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
     for epoch in range(start_epoch,total_epoch):
 
         with torch.no_grad():
-            if pp.cluster_size>0 and (epoch-1)%dp.densification_interval==0:
-                xyz,scale,rot,sh_0,sh_rest,opacity=scene.spatial_refine(pp.cluster_size>0,opt,xyz)
+            if epoch%pp.spatial_refine_interval==0:#spatial refine
+                scene.spatial_refine(pp.cluster_size>0,opt,xyz)
+            if pp.cluster_size>0 and (epoch%pp.spatial_refine_interval==0 or density_controller.is_densify_actived(epoch-1)):
                 cluster_origin,cluster_extend=scene.cluster.get_cluster_AABB(xyz,scale.exp(),torch.nn.functional.normalize(rot,dim=0))
             if actived_sh_degree<lp.sh_degree:
                 actived_sh_degree=min(int(epoch/5),lp.sh_degree)
-        torch.cuda.synchronize()
+
         with StatisticsHelperInst.try_start(epoch):
-            for view_matrix,proj_matrix,frustumplane,gt_image,gt_mask,idx_tensor in train_loader:
+            for view_matrix,proj_matrix,frustumplane,gt_image,gt_mask in train_loader:
                 view_matrix=view_matrix.cuda()
                 proj_matrix=proj_matrix.cuda()
                 frustumplane=frustumplane.cuda()
                 gt_image=gt_image.cuda()/255.0
                 gt_mask=gt_mask.cuda().float()
                 inverse_mask = 1.0 - gt_mask
-                
-                if op.learnable_viewproj:
-                    #fix view matrix
-                    idx_tensor=idx_tensor.cuda()
-                    extr=denoised_training_extr(idx_tensor)
-                    intr=denoised_training_intr
-                    view_matrix,proj_matrix,viewproj_matrix,frustumplane=utils.wrapper.CreateViewProj.apply(extr,intr,gt_image.shape[2],gt_image.shape[3],0.01,5000)
 
-                #cluster culling 
-                (
-                    visible_chunkid,visible_chunks_num,
-                    culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity
-                )=render.render_preprocess(
-                    cluster_origin,cluster_extend,frustumplane,view_matrix,
-                    xyz,scale,rot,sh_0,sh_rest,opacity,
-                    frames_buffer.feedback_visible_chunks_num,idx_tensor,
-                    pp,actived_sh_degree
-                )
+                #cluster culling
+                visible_chunkid,culled_xyz,culled_scale,culled_rot,culled_sh_0,culled_sh_rest,culled_opacity=render.render_preprocess(cluster_origin,cluster_extend,frustumplane,
+                                                                                                               xyz,scale,rot,sh_0,sh_rest,opacity,op,pp)
+                img,transmitance,depth,normal=render.render(view_matrix,proj_matrix,culled_xyz,culled_scale,culled_rot,culled_sh_0,culled_sh_rest,culled_opacity,
+                                                            actived_sh_degree,gt_image.shape[2:],pp)
 
-                valid_length=None
-                if visible_chunks_num is not None:
-                    valid_length=visible_chunks_num*pp.cluster_size
-                img,transmitance,depth,normal,primitive_visible=render.render(
-                    view_matrix,proj_matrix,
-                    culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity,
-                    valid_length,frames_buffer.feedback_binning_allocate_size,idx_tensor,
-                    actived_sh_degree,gt_image.shape[2:],pp
-                )
-                
                 if has_masks:
                     rgb_loss_map = fused_ssim.FusedL1SSIMLossMap.apply(0.2, 0.01 ** 2, 0.03 ** 2, img, gt_image, "same", True)
-                    loss = __safe_masked_mean(rgb_loss_map, gt_mask.expand_as(rgb_loss_map))
+                    rgb_loss = __safe_masked_mean(rgb_loss_map, gt_mask.expand_as(rgb_loss_map))
+                    # bg_rgb_loss = __safe_masked_mean(img.abs(), inverse_mask.expand_as(img))
+                    loss = rgb_loss # + 0.5 * bg_rgb_loss
                     if transmitance is not None:
                         alpha = 1.0 - transmitance
                         fg_alpha_loss = __safe_masked_mean((1.0 - alpha).abs(), gt_mask)
                         bg_alpha_loss = __safe_masked_mean(alpha.abs(), inverse_mask)
                         loss = loss + 0.0 * fg_alpha_loss + bg_alpha_loss * 5
                 else:
-                    loss=fused_ssim.fused_l1_ssim_loss(img,gt_image)
-                if op.reg_weight>0.0:
-                    loss+=(culled_scale).square().mean()*op.reg_weight
-                if pp.enable_transmitance and not has_masks:
-                    loss+=(1-transmitance).abs().mean()
+                    l1_loss=__l1_loss(img,gt_image)
+                    ssim_loss:torch.Tensor=fused_ssim.fused_ssim(img,gt_image)
+                    loss=(1.0-op.lambda_dssim)*l1_loss+op.lambda_dssim*(1-ssim_loss)
                 loss.backward()
                 if StatisticsHelperInst.bStart:
                     StatisticsHelperInst.backward_callback()
-                if pp.sparse_grad:
-                    opt.step(visible_chunkid,visible_chunks_num,primitive_visible)
+                if pp.cluster_size and pp.sparse_grad:
+                    opt.step(visible_chunkid)
                 else:
                     opt.step()
                 opt.zero_grad(set_to_none = True)
-                if op.learnable_viewproj:
-                    view_opt.step()
-                    view_opt.zero_grad()
-                    # proj_opt.step()
-                    # proj_opt.zero_grad()
                 schedular.step()
 
         if epoch in test_epochs:
             with torch.no_grad():
-                _cluster_origin=None
-                _cluster_extend=None
-                if pp.cluster_size:
-                    _cluster_origin,_cluster_extend=scene.cluster.get_cluster_AABB(xyz,scale.exp(),torch.nn.functional.normalize(rot,dim=0))
                 psnr_metrics=psnr.PeakSignalNoiseRatio(data_range=(0.0,1.0)).cuda()
                 loaders={"Trainingset":train_loader}
                 if lp.eval:
                     loaders["Testset"]=test_loader
                 for name,loader in loaders.items():
                     psnr_list=[]
-                    for view_matrix,proj_matrix,frustumplane,gt_image,gt_mask,idx in loader:
+                    for view_matrix,proj_matrix,frustumplane,gt_image,gt_mask in loader:
                         view_matrix=view_matrix.cuda()
                         proj_matrix=proj_matrix.cuda()
                         frustumplane=frustumplane.cuda()
                         gt_image=gt_image.cuda()/255.0
                         gt_mask=gt_mask.cuda().float()
-                        idx=idx.cuda()
-                        if op.learnable_viewproj:
-                            if name=="Trainingset":
-                                #fix view matrix
-                                extr=denoised_training_extr(idx)
-                                intr=denoised_training_intr
-                            else:
-                                nearest_idx=(extr-denoised_training_extr._parameters['weight']).abs().sum(dim=1).argmin()
-                                delta=denoised_training_extr(nearest_idx)-noise_extr[nearest_idx]
-                                extr=extr+delta
-                            view_matrix,proj_matrix,viewproj_matrix,frustumplane=utils.wrapper.CreateViewProj.apply(extr,intr,gt_image.shape[2],gt_image.shape[3],0.01,5000)
-
-                        #cluster culling
-                        visible_chunkid,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity=render.render_preprocess(cluster_origin,cluster_extend,frustumplane,view_matrix,xyz,scale,rot,sh_0,sh_rest,opacity,op,pp,actived_sh_degree)
-                        img,transmitance,depth,normal,primitive_visible=render.render(view_matrix,proj_matrix,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity,
+                        _,culled_xyz,culled_scale,culled_rot,culled_sh_0,culled_sh_rest,culled_opacity=render.render_preprocess(cluster_origin,cluster_extend,frustumplane,
+                                                                                                                xyz,scale,rot,sh_0,sh_rest,opacity,op,pp)
+                        img,transmitance,depth,normal=render.render(view_matrix,proj_matrix,culled_xyz,culled_scale,culled_rot,culled_sh_0,culled_sh_rest,culled_opacity,
                                                                     actived_sh_degree,gt_image.shape[2:],pp)
                         if has_masks:
                             psnr_list.append(psnr_metrics(img*gt_mask,gt_image*gt_mask).unsqueeze(0))
@@ -234,14 +175,6 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
         progress_bar.update()  
 
         if epoch in save_ply or epoch==total_epoch-1:
-            if epoch==total_epoch-1:
-                torch.cuda.synchronize()
-                progress_bar.close()
-                print("{} takes: {}".format(lp.model_path,progress_bar.format_dict['elapsed']))
-                save_path=os.path.join(lp.model_path,"point_cloud","finish")
-            else:
-                save_path=os.path.join(lp.model_path,"point_cloud","iteration_{}".format(epoch))    
-
             if pp.cluster_size:
                 tensors=scene.cluster.uncluster(xyz,scale,rot,sh_0,sh_rest,opacity)
             else:
@@ -249,9 +182,12 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
             param_nyp=[]
             for tensor in tensors:
                 param_nyp.append(tensor.detach().cpu().numpy())
-            io_manager.save_ply(os.path.join(save_path,"point_cloud.ply"),*param_nyp)
-            if op.learnable_viewproj:
-                torch.save(list(denoised_training_extr.parameters())+[denoised_training_intr],os.path.join(save_path,"viewproj.pth"))
+            if epoch==total_epoch-1:
+                ply_path=os.path.join(lp.model_path,"point_cloud","finish","point_cloud.ply")
+            else:
+                ply_path=os.path.join(lp.model_path,"point_cloud","iteration_{}".format(epoch),"point_cloud.ply")
+            io_manager.save_ply(ply_path,*param_nyp)
+            pass
 
         if epoch in save_checkpoint:
             io_manager.save_checkpoint(lp.model_path,epoch,opt,schedular)

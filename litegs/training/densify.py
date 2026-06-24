@@ -34,38 +34,19 @@ class DensityControllerBase:
 
     @torch.no_grad()
     def _cat_tensors_to_optimizer(self, tensors_dict:dict,optimizer:torch.optim.Optimizer):
-        cat_dim=-1
-        if self.bCluster:
-            cat_dim=-2
         for group in optimizer.param_groups:
             assert len(group["params"]) == 1
             extension_tensor = tensors_dict[group["name"]]
             stored_state = optimizer.state.get(group['params'][0], None)
             assert stored_state["exp_avg"].shape == stored_state["exp_avg_sq"].shape and stored_state["exp_avg"].shape==group["params"][0].shape
             if stored_state is not None:
-                stored_state["exp_avg"].data=torch.cat((stored_state["exp_avg"], torch.zeros_like(extension_tensor)), dim=cat_dim).contiguous()
-                stored_state["exp_avg_sq"].data=torch.cat((stored_state["exp_avg_sq"], torch.zeros_like(extension_tensor)), dim=cat_dim).contiguous()
-            new_param=torch.cat((group["params"][0], extension_tensor), dim=cat_dim).contiguous()
+                stored_state["exp_avg"].data=torch.cat((stored_state["exp_avg"], torch.zeros_like(extension_tensor)), dim=-2).contiguous()
+                stored_state["exp_avg_sq"].data=torch.cat((stored_state["exp_avg_sq"], torch.zeros_like(extension_tensor)), dim=-2).contiguous()
+            new_param=torch.cat((group["params"][0], extension_tensor), dim=-2).contiguous()
             optimizer.state.pop(group['params'][0])#pop param
             group["params"][0]=torch.nn.Parameter(new_param)
             optimizer.state[group["params"][0]]=stored_state#assign to new param
             assert stored_state["exp_avg"].shape == stored_state["exp_avg_sq"].shape and stored_state["exp_avg"].shape==group["params"][0].shape
-        return
-    
-    @torch.no_grad()
-    def _replace_tensor_to_optimizer(self, tensor:torch.Tensor, name:str,optimizer:torch.optim.Optimizer):
-        for group in optimizer.param_groups:
-            if group["name"] in ["appearance_embeddings", "appearance_network"]:
-                continue
-            if group["name"] == name:
-                stored_state = optimizer.state.get(group['params'][0], None)
-                stored_state["exp_avg"] = torch.zeros_like(tensor)
-                stored_state["exp_avg_sq"] = torch.zeros_like(tensor)
-                #stored_state["step"]=0#bugfix
-
-                del optimizer.state[group['params'][0]]
-                group["params"][0] = torch.nn.Parameter(tensor.requires_grad_(True))
-                optimizer.state[group['params'][0]] = stored_state
         return
     
     @torch.no_grad()
@@ -99,13 +80,13 @@ class DensityControllerBase:
     
 class DensityControllerOfficial(DensityControllerBase):
     @torch.no_grad()
-    def __init__(self,screen_extent:float,densify_params:DensifyParams,bCluster:bool,init_points_num:int)->None:
+    def __init__(self,screen_extent:int,densify_params:DensifyParams,bCluster:bool)->None:
         self.grad_threshold=densify_params.densify_grad_threshold
         self.min_opacity=densify_params.opacity_threshold
         self.percent_dense=densify_params.percent_dense
+        self.prune_large_point_from=densify_params.prune_large_point_from
         self.screen_extent=screen_extent
         self.max_screen_size=densify_params.screen_size_threshold
-        self.init_points_num=init_points_num
         super(DensityControllerOfficial,self).__init__(densify_params,bCluster)
         return
     
@@ -116,11 +97,13 @@ class DensityControllerOfficial(DensityControllerBase):
         invisible.shape[0]
         prune_mask=transparent
         prune_mask[:invisible.shape[0]]|=invisible
+        big_points_vs = StatisticsHelperInst.get_max('radii') > self.max_screen_size
+        prune_mask[:invisible.shape[0]]|=big_points_vs
         return prune_mask
 
     @torch.no_grad()
     def get_clone_mask(self,actived_scale:torch.Tensor)->torch.Tensor:
-        mean2d_grads=StatisticsHelperInst.get_mean('mean2d_grad').squeeze()
+        mean2d_grads=StatisticsHelperInst.get_mean('mean2d_grad')
         abnormal_mask = mean2d_grads >= self.grad_threshold
         tiny_pts_mask = actived_scale.max(dim=0).values <= self.percent_dense*self.screen_extent
         selected_pts_mask = abnormal_mask&tiny_pts_mask
@@ -128,14 +111,14 @@ class DensityControllerOfficial(DensityControllerBase):
     
     @torch.no_grad()
     def get_split_mask(self,actived_scale:torch.Tensor,N=2)->torch.Tensor:
-        mean2d_grads=StatisticsHelperInst.get_mean('mean2d_grad').squeeze()
+        mean2d_grads=StatisticsHelperInst.get_mean('mean2d_grad')
         abnormal_mask = mean2d_grads >= self.grad_threshold
         large_pts_mask = actived_scale.max(dim=0).values > self.percent_dense*self.screen_extent
         selected_pts_mask=abnormal_mask&large_pts_mask
         return selected_pts_mask
     
     @torch.no_grad()
-    def prune(self,optimizer:torch.optim.Optimizer,epoch:int):
+    def prune(self,optimizer:torch.optim.Optimizer):
         
         xyz,scale,rot,sh_0,sh_rest,opacity=self._get_params_from_optimizer(optimizer)
         if self.bCluster:
@@ -143,8 +126,6 @@ class DensityControllerOfficial(DensityControllerBase):
             xyz,scale,rot,sh_0,sh_rest,opacity=cluster.uncluster(xyz,scale,rot,sh_0,sh_rest,opacity)
 
         prune_mask=self.get_prune_mask(opacity.sigmoid(),scale.exp())
-        if prune_mask.sum()>0.8*opacity.shape[1]:
-            assert(False) #debug
         if self.bCluster:
             N=prune_mask.sum()
             chunk_num=int(N/chunk_size)
@@ -154,10 +135,11 @@ class DensityControllerOfficial(DensityControllerBase):
             prune_mask[del_indices]=True
         #print("\n #prune:{0} #points:{1}".format(prune_mask.sum(),(~prune_mask).sum()))
         self._prune_optimizer(~prune_mask,optimizer)
+        optimizer.state.clear()#prune large point damage the img
         return
 
     @torch.no_grad()
-    def split_and_clone(self,optimizer:torch.optim.Optimizer,epoch:int):
+    def split_and_clone(self,optimizer:torch.optim.Optimizer):
         
         xyz,scale,rot,sh_0,sh_rest,opacity=self._get_params_from_optimizer(optimizer)
         if self.bCluster:
@@ -171,18 +153,20 @@ class DensityControllerOfficial(DensityControllerBase):
         stds=scale[...,split_mask].exp()
         means=torch.zeros((3,stds.size(-1)),device="cuda")
         samples = torch.normal(mean=means, std=stds).unsqueeze(0)
-        transform_matrix=wrapper.CreateTransformMatrix.call_fused(torch.ones_like(scale[...,split_mask].exp()),torch.nn.functional.normalize(rot[...,split_mask],dim=0))
-        transform_matrix=transform_matrix[:3,:3]
-        shift=(samples.permute(2,0,1))@transform_matrix.permute(2,0,1)
+        transform_matrix=wrapper.CreateTransformMatrix.call_fused(scale[...,split_mask].exp(),torch.nn.functional.normalize(rot[...,split_mask],dim=0))
+        rotation_matrix=transform_matrix[:3,:3]
+        shift=(samples.permute(2,0,1))@rotation_matrix.permute(2,0,1)
         shift=shift.permute(1,2,0).squeeze(0)
         
         split_xyz=xyz[...,split_mask]+shift
         clone_xyz=xyz[...,clone_mask]
         append_xyz=torch.cat((split_xyz,clone_xyz),dim=-1)
+        xyz.data[...,split_mask]-=shift
         
         split_scale = (scale[...,split_mask].exp() / (0.8*2)).log()
         clone_scale = scale[...,clone_mask]
         append_scale = torch.cat((split_scale,clone_scale),dim=-1)
+        scale.data[...,split_mask]=split_scale
 
         split_rot=rot[...,split_mask]
         clone_rot=rot[...,clone_mask]
@@ -221,144 +205,41 @@ class DensityControllerOfficial(DensityControllerBase):
         return
     
     @torch.no_grad()
-    def reset_opacity(self,optimizer:torch.optim.Optimizer,epoch:int):
+    def reset_opacity(self,optimizer):
         xyz,scale,rot,sh_0,sh_rest,opacity=self._get_params_from_optimizer(optimizer)
         def inverse_sigmoid(x):
             return torch.log(x/(1-x))
         actived_opacities=opacity.sigmoid()
-        if self.densify_params.opacity_reset_mode=='decay':
-            decay_rate=0.5
-            opacity.data=inverse_sigmoid((actived_opacities*decay_rate).clamp_min(1.0/128))
-            optimizer.state.clear()
-        elif self.densify_params.opacity_reset_mode=='reset':
-            opacity.data=inverse_sigmoid(actived_opacities.clamp_max(0.005))
-            self._replace_tensor_to_optimizer(opacity,"opacity",optimizer)
-
+        decay_rate=0.5
+        decay_mask=(actived_opacities>1/(255*decay_rate-1))
+        decay_rate=decay_mask*decay_rate+(~decay_mask)*1.0
+        opacity.data=inverse_sigmoid(actived_opacities*decay_rate)#(actived_opacities.clamp_max(0.005))
+        optimizer.state.clear()
         return
     
     @torch.no_grad()
     def is_densify_actived(self,epoch:int):
 
         return epoch<self.densify_params.densify_until and epoch>=self.densify_params.densify_from and (
-            epoch%self.densify_params.densification_interval==0)
+            epoch%self.densify_params.densification_interval==0 or
+            epoch%self.densify_params.prune_interval==0)
 
     @torch.no_grad()
     def step(self,optimizer:torch.optim.Optimizer,epoch:int):
         if epoch<self.densify_params.densify_until and epoch>=self.densify_params.densify_from:
             bUpdate=False
             if epoch%self.densify_params.densification_interval==0:
-                self.split_and_clone(optimizer,epoch)
-                self.prune(optimizer,epoch)
+                self.split_and_clone(optimizer)
+                bUpdate=True
+            if epoch%self.densify_params.prune_interval==0:
+                self.prune(optimizer)
                 bUpdate=True
             if epoch%self.densify_params.opacity_reset_interval==0:
-                self.reset_opacity(optimizer,epoch)
+                self.reset_opacity(optimizer)
                 bUpdate=True
             if bUpdate:
                 xyz,scale,rot,sh_0,sh_rest,opacity=self._get_params_from_optimizer(optimizer)
                 StatisticsHelperInst.reset(xyz.shape[-2],xyz.shape[-1],self.is_densify_actived)
                 torch.cuda.empty_cache()
         return self._get_params_from_optimizer(optimizer)
-    
-
-class DensityControllerTamingGS(DensityControllerOfficial):
-    @torch.no_grad()
-    def __init__(self,screen_extent:int,densify_params:DensifyParams,bCluster:bool,init_points_num:int)->None:
-
-        assert(densify_params.target_primitives!=0.0)
-        self.target_points_num=densify_params.target_primitives
-        super(DensityControllerTamingGS,self).__init__(screen_extent,densify_params,bCluster,init_points_num)
-        return
-    
-    @torch.no_grad()
-    def get_prune_mask(self,actived_opacity:torch.Tensor,actived_scale:torch.Tensor)->torch.Tensor:
-        if self.densify_params.prune_mode == 'weight':
-            prune_mask=torch.zeros(actived_opacity.shape[1],device=actived_opacity.device).bool()
-
-            frag_weight,frag_count=StatisticsHelperInst.get_mean('fragment_weight')
-            weight_sum=(frag_weight*frag_count).nan_to_num(0).squeeze()
-            invisible = weight_sum==0#weight_sum<(weight_sum[weight_sum!=0].quantile(0.05))
-            prune_mask[:invisible.shape[0]]|=invisible
-        elif self.densify_params.prune_mode == 'threshold':
-            prune_mask=super(DensityControllerTamingGS,self).get_prune_mask(actived_opacity,actived_scale)
-        
-        return prune_mask
-    
-    def get_score(self,xyz,scale,rot,sh_0,sh_rest,opacity)->torch.Tensor:
-        var,frag_count=StatisticsHelperInst.get_var('fragment_err')
-        #score=(var*frag_count).sqrt()*(opacity.sigmoid())
-        score=var*frag_count*(opacity.sigmoid()*opacity.sigmoid())
-        score=score.squeeze().nan_to_num(0)
-        score.clamp_min_(0)
-        return score
-    
-    @torch.no_grad()
-    def split_and_clone(self,optimizer:torch.optim.Optimizer,epoch:int):
-        
-        xyz,scale,rot,sh_0,sh_rest,opacity=self._get_params_from_optimizer(optimizer)
-        if self.bCluster:
-            chunk_size=xyz.shape[-1]
-            xyz,scale,rot,sh_0,sh_rest,opacity=cluster.uncluster(xyz,scale,rot,sh_0,sh_rest,opacity)
-
-        prune_num=self.get_prune_mask(opacity.sigmoid(),scale.exp()).sum()
-
-        cur_target_count = (self.target_points_num - self.init_points_num) / (self.densify_params.densify_until - self.densify_params.densify_from) * (epoch-self.densify_params.densify_from)+self.init_points_num
-        budget=min(max(int(cur_target_count-xyz.shape[-1]),1)+prune_num,xyz.shape[-1])
-
-        score=self.get_score(xyz,scale,rot,sh_0,sh_rest,opacity)
-        densify_index = torch.multinomial(score, budget, replacement=False)
-        clone_index=densify_index[(scale[:,densify_index].exp().max(dim=0).values <= self.percent_dense*self.screen_extent)]
-        split_index=densify_index[(scale[:,densify_index].exp().max(dim=0).values > self.percent_dense*self.screen_extent)]
-
-        #split
-        stds=scale[...,split_index].exp()
-        means=torch.zeros((3,stds.size(-1)),device="cuda")
-        samples = torch.normal(mean=means, std=stds).unsqueeze(0)
-        transform_matrix=wrapper.CreateTransformMatrix.call_fused(torch.ones_like(scale[...,split_index]),torch.nn.functional.normalize(rot[...,split_index],dim=0))
-        transform_matrix=transform_matrix[:3,:3]
-        shift=(samples.permute(2,0,1))@transform_matrix.permute(2,0,1)
-        shift=shift.permute(1,2,0).squeeze(0)
-        
-        split_xyz=xyz[...,split_index]+shift
-        clone_xyz=xyz[...,clone_index]
-        append_xyz=torch.cat((split_xyz,clone_xyz),dim=-1)
-        
-        split_scale = (scale[...,split_index].exp() / (0.8*2)).log()
-        clone_scale = scale[...,clone_index]
-        append_scale = torch.cat((split_scale,clone_scale),dim=-1)
-
-        split_rot=rot[...,split_index]
-        clone_rot=rot[...,clone_index]
-        append_rot = torch.cat((split_rot,clone_rot),dim=-1)
-
-        split_sh_0=sh_0[...,split_index]
-        clone_sh_0=sh_0[...,clone_index]
-        append_sh_0 = torch.cat((split_sh_0,clone_sh_0),dim=-1)
-
-        split_sh_rest=sh_rest[...,split_index]
-        clone_sh_rest=sh_rest[...,clone_index]
-        append_sh_rest = torch.cat((split_sh_rest,clone_sh_rest),dim=-1)
-
-        split_opacity=opacity[...,split_index]
-        clone_opacity=opacity[...,clone_index]
-        append_opacity = torch.cat((split_opacity,clone_opacity),dim=-1)
-
-        if self.bCluster:
-            N=append_xyz.shape[-1]
-            chunk_num=int(N/chunk_size)
-            append_limit=chunk_num*chunk_size
-            append_xyz,append_scale,append_rot,append_sh_0,append_sh_rest,append_opacity=cluster.cluster_points(
-                chunk_size,append_xyz[...,:append_limit],append_scale[...,:append_limit],
-                append_rot[...,:append_limit],append_sh_0[...,:append_limit],
-                append_sh_rest[...,:append_limit],append_opacity[...,:append_limit])
-
-        dict_clone = {"xyz": append_xyz,
-                      "scale": append_scale,
-                      "rot" : append_rot,
-                      "sh_0": append_sh_0,
-                      "sh_rest": append_sh_rest,
-                      "opacity" : append_opacity}
-        
-        #print("\n#clone:{0} #split:{1} #points:{2}".format(clone_index.sum().cpu(),split_index.sum().cpu(),xyz.shape[-1]+append_xyz.shape[-1]*append_xyz.shape[-2]))
-        self._cat_tensors_to_optimizer(dict_clone,optimizer)
-        return
     
