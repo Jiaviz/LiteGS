@@ -34,19 +34,21 @@ class DensityControllerBase:
 
     @torch.no_grad()
     def _cat_tensors_to_optimizer(self, tensors_dict:dict,optimizer:torch.optim.Optimizer):
+        point_dimension = -2 if self.bCluster else -1
         for group in optimizer.param_groups:
             assert len(group["params"]) == 1
             extension_tensor = tensors_dict[group["name"]]
             stored_state = optimizer.state.get(group['params'][0], None)
-            assert stored_state["exp_avg"].shape == stored_state["exp_avg_sq"].shape and stored_state["exp_avg"].shape==group["params"][0].shape
             if stored_state is not None:
-                stored_state["exp_avg"].data=torch.cat((stored_state["exp_avg"], torch.zeros_like(extension_tensor)), dim=-2).contiguous()
-                stored_state["exp_avg_sq"].data=torch.cat((stored_state["exp_avg_sq"], torch.zeros_like(extension_tensor)), dim=-2).contiguous()
-            new_param=torch.cat((group["params"][0], extension_tensor), dim=-2).contiguous()
+                assert stored_state["exp_avg"].shape == stored_state["exp_avg_sq"].shape and stored_state["exp_avg"].shape==group["params"][0].shape
+                stored_state["exp_avg"].data=torch.cat((stored_state["exp_avg"], torch.zeros_like(extension_tensor)), dim=point_dimension).contiguous()
+                stored_state["exp_avg_sq"].data=torch.cat((stored_state["exp_avg_sq"], torch.zeros_like(extension_tensor)), dim=point_dimension).contiguous()
+            new_param=torch.cat((group["params"][0], extension_tensor), dim=point_dimension).contiguous()
             optimizer.state.pop(group['params'][0])#pop param
             group["params"][0]=torch.nn.Parameter(new_param)
-            optimizer.state[group["params"][0]]=stored_state#assign to new param
-            assert stored_state["exp_avg"].shape == stored_state["exp_avg_sq"].shape and stored_state["exp_avg"].shape==group["params"][0].shape
+            if stored_state is not None:
+                optimizer.state[group["params"][0]]=stored_state#assign to new param
+                assert stored_state["exp_avg"].shape == stored_state["exp_avg_sq"].shape and stored_state["exp_avg"].shape==group["params"][0].shape
         return
     
     @torch.no_grad()
@@ -87,6 +89,8 @@ class DensityControllerOfficial(DensityControllerBase):
         self.prune_large_point_from=densify_params.prune_large_point_from
         self.screen_extent=screen_extent
         self.max_screen_size=densify_params.screen_size_threshold
+        self.max_gaussians=int(densify_params.max_gaussians)
+        self._reported_gradient_stats = False
         super(DensityControllerOfficial,self).__init__(densify_params,bCluster)
         return
     
@@ -126,6 +130,18 @@ class DensityControllerOfficial(DensityControllerBase):
             xyz,scale,rot,sh_0,sh_rest,opacity=cluster.uncluster(xyz,scale,rot,sh_0,sh_rest,opacity)
 
         prune_mask=self.get_prune_mask(opacity.sigmoid(),scale.exp())
+        total_points = int(prune_mask.numel())
+        remaining_points = int((~prune_mask).sum().item())
+        # Early opacity estimates are noisy in masked training. A single
+        # aggressive prune must never discard most of the usable surface.
+        minimum_remaining = min(total_points, max(256, total_points // 2))
+        if remaining_points < minimum_remaining:
+            print(
+                f"[LiteGS] Skipping unstable prune: it would keep only "
+                f"{remaining_points}/{total_points} Gaussians "
+                f"(minimum safe count: {minimum_remaining})."
+            )
+            return
         if self.bCluster:
             N=prune_mask.sum()
             chunk_num=int(N/chunk_size)
@@ -133,7 +149,10 @@ class DensityControllerOfficial(DensityControllerBase):
             del_indices=prune_mask.nonzero()[:del_limit,0]
             prune_mask=torch.zeros_like(prune_mask)
             prune_mask[del_indices]=True
-        #print("\n #prune:{0} #points:{1}".format(prune_mask.sum(),(~prune_mask).sum()))
+        print(
+            f"[LiteGS] Pruned {int(prune_mask.sum().item())} Gaussians; "
+            f"{int((~prune_mask).sum().item())} remain."
+        )
         self._prune_optimizer(~prune_mask,optimizer)
         optimizer.state.clear()#prune large point damage the img
         return
@@ -148,6 +167,51 @@ class DensityControllerOfficial(DensityControllerBase):
 
         clone_mask=self.get_clone_mask(scale.exp())
         split_mask=self.get_split_mask(scale.exp())
+        current_points = int(xyz.shape[-1])
+        if self.max_gaussians > 0:
+            remaining_capacity = self.max_gaussians - current_points
+            candidate_mask = clone_mask | split_mask
+            candidate_count = int(candidate_mask.sum().item())
+            if remaining_capacity <= 0:
+                print(
+                    f"[LiteGS] Skipping densification: reached the "
+                    f"{self.max_gaussians} Gaussian safety limit."
+                )
+                return
+            if candidate_count > remaining_capacity:
+                mean2d_grads = StatisticsHelperInst.get_mean('mean2d_grad')
+                candidate_indices = candidate_mask.nonzero(as_tuple=False).flatten()
+                keep_count = min(remaining_capacity, int(candidate_indices.numel()))
+                strongest_local = torch.topk(
+                    mean2d_grads[candidate_indices],
+                    k=keep_count,
+                    largest=True,
+                    sorted=False,
+                ).indices
+                keep_mask = torch.zeros_like(candidate_mask)
+                keep_mask[candidate_indices[strongest_local]] = True
+                clone_mask &= keep_mask
+                split_mask &= keep_mask
+                print(
+                    f"[LiteGS] Capped densification to {keep_count} additions; "
+                    f"the model will reach at most {self.max_gaussians} Gaussians."
+                )
+        if not self._reported_gradient_stats:
+            mean2d_grads = StatisticsHelperInst.get_mean('mean2d_grad')
+            finite_grads = mean2d_grads[torch.isfinite(mean2d_grads)]
+            if finite_grads.numel() > 0:
+                quantiles = torch.quantile(
+                    finite_grads.float(),
+                    torch.tensor([0.5, 0.9, 0.99], device=finite_grads.device),
+                )
+                print(
+                    "[LiteGS] Densification gradient stats: "
+                    f"median={float(quantiles[0]):.3e}, "
+                    f"p90={float(quantiles[1]):.3e}, "
+                    f"p99={float(quantiles[2]):.3e}, "
+                    f"threshold={self.grad_threshold:.3e}."
+                )
+            self._reported_gradient_stats = True
 
         #split
         stds=scale[...,split_mask].exp()
@@ -239,7 +303,8 @@ class DensityControllerOfficial(DensityControllerBase):
                 bUpdate=True
             if bUpdate:
                 xyz,scale,rot,sh_0,sh_rest,opacity=self._get_params_from_optimizer(optimizer)
-                StatisticsHelperInst.reset(xyz.shape[-2],xyz.shape[-1],self.is_densify_actived)
+                statistics_chunk_num = xyz.shape[-2] if self.bCluster else 1
+                StatisticsHelperInst.reset(statistics_chunk_num,xyz.shape[-1],self.is_densify_actived)
                 torch.cuda.empty_cache()
         return self._get_params_from_optimizer(optimizer)
     

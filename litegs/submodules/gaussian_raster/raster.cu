@@ -246,6 +246,180 @@ std::vector<at::Tensor> rasterize_forward(
     return { output_img ,output_transmitance,output_depth ,output_last_contributor };
 }
 
+// Forward-mode derivative of alpha compositing. Each thread owns one output
+// pixel and propagates all six se(3) tangent directions in registers. The
+// Gaussian screen-space tangents are analytical and supplied by the caller.
+template <int tilesize>
+__global__ void raster_pose_jacobian_kernel(
+    const torch::PackedTensorAccessor32<int32_t, 2, torch::RestrictPtrTraits> sorted_points,
+    const torch::PackedTensorAccessor32<int32_t, 2, torch::RestrictPtrTraits> start_index,
+    const torch::PackedTensorAccessor32<float, 3, torch::RestrictPtrTraits> ndc,
+    const torch::PackedTensorAccessor32<float, 4, torch::RestrictPtrTraits> cov2d_inv,
+    const torch::PackedTensorAccessor32<float, 3, torch::RestrictPtrTraits> color,
+    const torch::PackedTensorAccessor32<float, 2, torch::RestrictPtrTraits> opacity,
+    const torch::PackedTensorAccessor32<float, 4, torch::RestrictPtrTraits> dndc_dpose,
+    const torch::PackedTensorAccessor32<float, 5, torch::RestrictPtrTraits> dcov_dpose,
+    const torch::PackedTensorAccessor32<float, 4, torch::RestrictPtrTraits> dcolor_dpose,
+    torch::PackedTensorAccessor32<float, 6, torch::RestrictPtrTraits> output,
+    int tiles_num_x, int img_h, int img_w)
+{
+    constexpr int chunk = tilesize * tilesize / 4;
+    __shared__ int point_ids[chunk];
+    __shared__ float2 means[chunk];
+    __shared__ float3 inv_covs[chunk];
+    __shared__ float3 colors[chunk];
+    __shared__ float opacities[chunk];
+    __shared__ float mean_jacs[chunk][2][6];
+    __shared__ float cov_jacs[chunk][3][6];
+    __shared__ float color_jacs[chunk][3][6];
+
+    const int batch = blockIdx.y;
+    const int tile_index = blockIdx.x;
+    const int tile_id = tile_index + 1;
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int linear_thread = ty * tilesize + tx;
+    const int pixel_x = (tile_index % tiles_num_x) * tilesize + tx;
+    const int pixel_y = (tile_index / tiles_num_x) * tilesize + ty;
+    const bool valid_pixel = pixel_x < img_w && pixel_y < img_h;
+
+    float transmittance = 1.0f;
+    float dtrans[6] = {0, 0, 0, 0, 0, 0};
+    float dimage[3][6] = {{0}};
+    bool done = !valid_pixel;
+
+    if (tile_id < start_index.size(1) - 1) {
+        const int begin = start_index[batch][tile_id];
+        const int end = start_index[batch][tile_id + 1];
+        if (begin != -1) {
+            for (int offset = begin; offset < end; offset += chunk) {
+                const int valid_count = min(chunk, end - offset);
+                if (linear_thread < valid_count) {
+                    const int p = sorted_points[batch][offset + linear_thread];
+                    point_ids[linear_thread] = p;
+                    means[linear_thread] = make_float2(
+                        (ndc[batch][0][p] + 1.0f) * 0.5f * img_w - 0.5f,
+                        (ndc[batch][1][p] + 1.0f) * 0.5f * img_h - 0.5f);
+                    inv_covs[linear_thread] = make_float3(
+                        cov2d_inv[batch][0][0][p], cov2d_inv[batch][0][1][p],
+                        cov2d_inv[batch][1][1][p]);
+                    colors[linear_thread] = make_float3(
+                        color[batch][0][p], color[batch][1][p], color[batch][2][p]);
+                    opacities[linear_thread] = opacity[0][p];
+                    #pragma unroll
+                    for (int k = 0; k < 6; ++k) {
+                        mean_jacs[linear_thread][0][k] = dndc_dpose[batch][0][p][k] * 0.5f * img_w;
+                        mean_jacs[linear_thread][1][k] = dndc_dpose[batch][1][p][k] * 0.5f * img_h;
+                        cov_jacs[linear_thread][0][k] = dcov_dpose[batch][0][0][p][k];
+                        cov_jacs[linear_thread][1][k] = dcov_dpose[batch][0][1][p][k];
+                        cov_jacs[linear_thread][2][k] = dcov_dpose[batch][1][1][p][k];
+                        color_jacs[linear_thread][0][k] = dcolor_dpose[batch][0][p][k];
+                        color_jacs[linear_thread][1][k] = dcolor_dpose[batch][1][p][k];
+                        color_jacs[linear_thread][2][k] = dcolor_dpose[batch][2][p][k];
+                    }
+                }
+                __syncthreads();
+
+                for (int i = 0; i < valid_count && !done; ++i) {
+                    const float dx = means[i].x - pixel_x;
+                    const float dy = means[i].y - pixel_y;
+                    const float3 Cinv = inv_covs[i];
+                    const float power = -0.5f * (Cinv.x * dx * dx + Cinv.z * dy * dy)
+                                      - Cinv.y * dx * dy;
+                    if (power > 0.0f) continue;
+                    const float raw_alpha = opacities[i] * expf(power);
+                    const float alpha = min(0.99f, raw_alpha);
+                    if (alpha < 1.0f / 255.0f) continue;
+                    if (transmittance * (1.0f - alpha) < 0.0001f) {
+                        done = true;
+                        continue;
+                    }
+
+                    float dalpha[6];
+                    #pragma unroll
+                    for (int k = 0; k < 6; ++k) {
+                        const float dmx = mean_jacs[i][0][k];
+                        const float dmy = mean_jacs[i][1][k];
+                        const float dpower =
+                            -0.5f * (cov_jacs[i][0][k] * dx * dx + cov_jacs[i][2][k] * dy * dy)
+                            -cov_jacs[i][1][k] * dx * dy
+                            -(Cinv.x * dx + Cinv.y * dy) * dmx
+                            -(Cinv.z * dy + Cinv.y * dx) * dmy;
+                        dalpha[k] = raw_alpha < 0.99f ? alpha * dpower : 0.0f;
+                    }
+
+                    const float3 rgb = colors[i];
+                    #pragma unroll
+                    for (int k = 0; k < 6; ++k) {
+                        dimage[0][k] += color_jacs[i][0][k] * alpha * transmittance
+                                      + rgb.x * (dalpha[k] * transmittance + alpha * dtrans[k]);
+                        dimage[1][k] += color_jacs[i][1][k] * alpha * transmittance
+                                      + rgb.y * (dalpha[k] * transmittance + alpha * dtrans[k]);
+                        dimage[2][k] += color_jacs[i][2][k] * alpha * transmittance
+                                      + rgb.z * (dalpha[k] * transmittance + alpha * dtrans[k]);
+                        dtrans[k] = dtrans[k] * (1.0f - alpha) - transmittance * dalpha[k];
+                    }
+                    transmittance *= 1.0f - alpha;
+                }
+                __syncthreads();
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int c = 0; c < 3; ++c)
+        #pragma unroll
+        for (int k = 0; k < 6; ++k)
+            output[batch][c][tile_index][ty][tx][k] = dimage[c][k];
+}
+
+at::Tensor rasterize_pose_jacobian(
+    at::Tensor sorted_points, at::Tensor start_index, at::Tensor ndc,
+    at::Tensor cov2d_inv, at::Tensor color, at::Tensor opacity,
+    at::Tensor dndc_dpose, at::Tensor dcov2d_inv_dpose,
+    at::Tensor dcolor_dpose, int64_t tilesize, int64_t img_h, int64_t img_w)
+{
+    at::DeviceGuard guard(ndc.device());
+    const int64_t views = start_index.size(0);
+    const int tiles_x = std::ceil(img_w / float(tilesize));
+    const int tiles_y = std::ceil(img_h / float(tilesize));
+    const int tiles = tiles_x * tiles_y;
+    at::Tensor output = torch::zeros({views, 3, tiles, tilesize, tilesize, 6}, ndc.options());
+    dim3 blocks(tiles, views, 1);
+    dim3 threads(tilesize, tilesize, 1);
+    if (tilesize == 8) {
+        raster_pose_jacobian_kernel<8><<<blocks, threads>>>(
+            sorted_points.packed_accessor32<int32_t, 2, torch::RestrictPtrTraits>(),
+            start_index.packed_accessor32<int32_t, 2, torch::RestrictPtrTraits>(),
+            ndc.packed_accessor32<float, 3, torch::RestrictPtrTraits>(),
+            cov2d_inv.packed_accessor32<float, 4, torch::RestrictPtrTraits>(),
+            color.packed_accessor32<float, 3, torch::RestrictPtrTraits>(),
+            opacity.packed_accessor32<float, 2, torch::RestrictPtrTraits>(),
+            dndc_dpose.packed_accessor32<float, 4, torch::RestrictPtrTraits>(),
+            dcov2d_inv_dpose.packed_accessor32<float, 5, torch::RestrictPtrTraits>(),
+            dcolor_dpose.packed_accessor32<float, 4, torch::RestrictPtrTraits>(),
+            output.packed_accessor32<float, 6, torch::RestrictPtrTraits>(),
+            tiles_x, img_h, img_w);
+    } else if (tilesize == 16) {
+        raster_pose_jacobian_kernel<16><<<blocks, threads>>>(
+            sorted_points.packed_accessor32<int32_t, 2, torch::RestrictPtrTraits>(),
+            start_index.packed_accessor32<int32_t, 2, torch::RestrictPtrTraits>(),
+            ndc.packed_accessor32<float, 3, torch::RestrictPtrTraits>(),
+            cov2d_inv.packed_accessor32<float, 4, torch::RestrictPtrTraits>(),
+            color.packed_accessor32<float, 3, torch::RestrictPtrTraits>(),
+            opacity.packed_accessor32<float, 2, torch::RestrictPtrTraits>(),
+            dndc_dpose.packed_accessor32<float, 4, torch::RestrictPtrTraits>(),
+            dcov2d_inv_dpose.packed_accessor32<float, 5, torch::RestrictPtrTraits>(),
+            dcolor_dpose.packed_accessor32<float, 4, torch::RestrictPtrTraits>(),
+            output.packed_accessor32<float, 6, torch::RestrictPtrTraits>(),
+            tiles_x, img_h, img_w);
+    } else {
+        TORCH_CHECK(false, "rasterize_pose_jacobian supports tile sizes 8 and 16");
+    }
+    CUDA_CHECK_ERRORS;
+    return output;
+}
+
 template <int tilesize,bool enable_trans_grad,bool enable_depth_grad>
 __global__ void raster_backward_kernel_warp_reduction(
     const torch::PackedTensorAccessor32<int32_t, 2, torch::RestrictPtrTraits> sorted_points,    //[batch,tile]  p.s. tile_id 0 is invalid!
@@ -866,4 +1040,3 @@ std::vector<at::Tensor> rasterize_backward(
     
     return { d_ndc ,d_cov2d_inv ,d_color,d_opacity };
 }
-

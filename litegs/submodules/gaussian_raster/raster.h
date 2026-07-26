@@ -15,6 +15,21 @@ std::vector<at::Tensor> rasterize_forward(
     bool enable_depth
 );
 
+at::Tensor rasterize_pose_jacobian(
+    at::Tensor sorted_points,
+    at::Tensor start_index,
+    at::Tensor ndc,
+    at::Tensor cov2d_inv,
+    at::Tensor color,
+    at::Tensor opacity,
+    at::Tensor dndc_dpose,
+    at::Tensor dcov2d_inv_dpose,
+    at::Tensor dcolor_dpose,
+    int64_t tilesize,
+    int64_t img_h,
+    int64_t img_w
+);
+
 std::vector<at::Tensor> rasterize_backward(
     at::Tensor sorted_points,
     at::Tensor start_index,

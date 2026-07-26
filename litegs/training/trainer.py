@@ -1,10 +1,10 @@
 import torch
 from torch.utils.data import DataLoader
 import fused_ssim
-from torchmetrics.image import psnr
 from tqdm import tqdm
 import numpy as np
 import os
+from PIL import Image
 import torch.cuda.nvtx as nvtx
 
 from .. import arguments
@@ -28,7 +28,8 @@ def __safe_masked_mean(values:torch.Tensor, weights:torch.Tensor)->torch.Tensor:
     return weighted_sum / normalizer
 
 def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.PipelineParams,dp:arguments.DensifyParams,
-          test_epochs=[],save_ply=[],save_checkpoint=[],start_checkpoint:str=None):
+          test_epochs=[],save_ply=[],save_checkpoint=[],start_checkpoint:str=None,
+          save_eval_images:bool=False,eval_image_count:int=8):
     
     cameras_info:dict[int,data.CameraInfo]=None
     camera_frames:list[data.CameraFrame]=None
@@ -49,8 +50,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
     has_masks=os.path.isdir(mask_root)
     if has_masks:
         pp.enable_transmitance=True
-        dp.densify_until = 0
-        print("[LiteGS] Disabling densification for masked object-centric training.")
+        print("[LiteGS] Enabling mask-aware densification for object-centric training.")
     trainingset=CameraFrameDataset(cameras_info,training_frames,lp.resolution,pp.device_preload,mask_root=mask_root)
     train_loader = DataLoader(trainingset, batch_size=1,shuffle=True,pin_memory=not pp.device_preload)
     test_loader=None
@@ -94,7 +94,8 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
     if dp.densify_until<0:
         dp.densify_until=int(int(total_epoch/2)/dp.opacity_reset_interval)*dp.opacity_reset_interval
     density_controller=densify.DensityControllerOfficial(norm_radius,dp,pp.cluster_size>0)
-    StatisticsHelperInst.reset(xyz.shape[-2],xyz.shape[-1],density_controller.is_densify_actived)
+    statistics_chunk_num = xyz.shape[-2] if pp.cluster_size else 1
+    StatisticsHelperInst.reset(statistics_chunk_num,xyz.shape[-1],density_controller.is_densify_actived)
     progress_bar = tqdm(range(start_epoch, total_epoch), desc="Training progress")
     progress_bar.update(0)
 
@@ -132,7 +133,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                         alpha = 1.0 - transmitance
                         fg_alpha_loss = __safe_masked_mean((1.0 - alpha).abs(), gt_mask)
                         bg_alpha_loss = __safe_masked_mean(alpha.abs(), inverse_mask)
-                        loss = loss + 0.0 * fg_alpha_loss + bg_alpha_loss * 5
+                        loss = loss + 2.0 * fg_alpha_loss + bg_alpha_loss * 2
                 else:
                     l1_loss=__l1_loss(img,gt_image)
                     ssim_loss:torch.Tensor=fused_ssim.fused_ssim(img,gt_image)
@@ -149,13 +150,12 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
 
         if epoch in test_epochs:
             with torch.no_grad():
-                psnr_metrics=psnr.PeakSignalNoiseRatio(data_range=(0.0,1.0)).cuda()
                 loaders={"Trainingset":train_loader}
                 if lp.eval:
                     loaders["Testset"]=test_loader
                 for name,loader in loaders.items():
                     psnr_list=[]
-                    for view_matrix,proj_matrix,frustumplane,gt_image,gt_mask in loader:
+                    for eval_index,(view_matrix,proj_matrix,frustumplane,gt_image,gt_mask) in enumerate(loader):
                         view_matrix=view_matrix.cuda()
                         proj_matrix=proj_matrix.cuda()
                         frustumplane=frustumplane.cuda()
@@ -166,10 +166,40 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                         img,transmitance,depth,normal=render.render(view_matrix,proj_matrix,culled_xyz,culled_scale,culled_rot,culled_sh_0,culled_sh_rest,culled_opacity,
                                                                     actived_sh_degree,gt_image.shape[2:],pp)
                         if has_masks:
-                            psnr_list.append(psnr_metrics(img*gt_mask,gt_image*gt_mask).unsqueeze(0))
+                            squared_error = (img - gt_image).square() * gt_mask
+                            mse = squared_error.sum() / (gt_mask.sum() * img.shape[1]).clamp_min(1.0)
                         else:
-                            psnr_list.append(psnr_metrics(img,gt_image).unsqueeze(0))
-                    tqdm.write("\n[EPOCH {}] {} Evaluating: PSNR {}".format(epoch,name,torch.concat(psnr_list,dim=0).mean()))
+                            mse = (img - gt_image).square().mean()
+                        psnr_list.append((-10.0 * torch.log10(mse.clamp_min(1e-10))).unsqueeze(0))
+                        if save_eval_images and eval_index < eval_image_count:
+                            render_rgb = (
+                                img[0].detach().clamp(0.0, 1.0).mul(255.0)
+                                .byte().permute(1, 2, 0).cpu().numpy()
+                            )
+                            gt_rgb = gt_image[0].detach().clamp(0.0, 1.0).mul(255.0).byte().permute(1, 2, 0).cpu().numpy()
+                            comparison = np.concatenate((gt_rgb, render_rgb), axis=1)
+                            mask_rgb = (
+                                gt_mask[0].detach().clamp(0.0, 1.0)
+                                .permute(1, 2, 0).cpu().numpy()
+                            )
+                            masked_gt_rgb = (gt_rgb.astype(np.float32) * mask_rgb).astype(np.uint8)
+                            masked_render_rgb = (render_rgb.astype(np.float32) * mask_rgb).astype(np.uint8)
+                            masked_comparison = np.concatenate((masked_gt_rgb, masked_render_rgb), axis=1)
+                            eval_dir = os.path.join(lp.model_path, "eval", "epoch_{:04d}".format(epoch), name.lower())
+                            os.makedirs(eval_dir, exist_ok=True)
+                            Image.fromarray(comparison).save(os.path.join(eval_dir, "{:03d}_gt_render.png".format(eval_index)))
+                            Image.fromarray(masked_comparison).save(
+                                os.path.join(eval_dir, "{:03d}_masked_gt_render.png".format(eval_index))
+                            )
+                    metric_scope = "foreground " if has_masks else ""
+                    tqdm.write(
+                        "\n[EPOCH {}] {} Evaluating: {}PSNR {}".format(
+                            epoch,
+                            name,
+                            metric_scope,
+                            torch.concat(psnr_list, dim=0).mean(),
+                        )
+                    )
 
         xyz,scale,rot,sh_0,sh_rest,opacity=density_controller.step(opt,epoch)
         progress_bar.update()  

@@ -13,6 +13,7 @@ setup(
             "compact.cu",
             "cuda_errchk.cpp",
             "ext_cuda.cpp",
+            "pose_jacobian.cu",
             "raster.cu",
             "transform.cu"])
         ],

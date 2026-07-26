@@ -58,6 +58,7 @@ class StatisticsHelper:
     @torch.no_grad()
     def update_visible_count(self,compacted_visible_mask:torch.Tensor):
         if self.compact_mask is None:
+            self.visible_count += compacted_visible_mask.sum(0).reshape(self.chunk_num,self.chunk_size)
             return
         self.visible_count[self.compact_mask]+=compacted_visible_mask.sum(0).reshape(-1,self.chunk_size)
         return
@@ -104,15 +105,15 @@ class StatisticsHelper:
     @torch.no_grad()
     def update_max_min(self,key:str,tensor:torch.Tensor):
         #update dict
-        tensor_max=tensor.max(0)[0]
-        tensor_min=tensor.min(0)[0]
+        tensor_max=tensor.max(0)[0].reshape(self.chunk_num,self.chunk_size)
+        tensor_min=tensor.min(0)[0].reshape(self.chunk_num,self.chunk_size)
         data=self.max_and_min.get(key,None)
         if data is not None:
             data[0]=torch.max(tensor_max,data[0])
             data[1]=torch.min(tensor_min,data[1])
         else:
-            data=(tensor_max,tensor_min)
-            self.mean_and_std[key]=data
+            data=[tensor_max,tensor_min]
+            self.max_and_min[key]=data
         return
 
 

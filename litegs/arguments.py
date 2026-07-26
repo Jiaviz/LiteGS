@@ -101,6 +101,9 @@ class DensifyParams(ParamGroup):
     prune_large_point_from=40
     screen_size_threshold=128#tile
     percent_dense = 0.01
+    # Hard safety limit for unclustered/object-centric training. A negative
+    # value preserves the original unlimited behavior.
+    max_gaussians = -1
     def __init__(self, parser):
         super().__init__(parser, "Densify Parameters")
         

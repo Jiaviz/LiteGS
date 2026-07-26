@@ -33,14 +33,18 @@ class PinHoleCameraInfo(CameraInfo):
         super(PinHoleCameraInfo,self).__init__(id,"PINHOLE",width,height)
         focal_length_x=parameters[0]
         focal_length_y=parameters[1]
+        principal_point_x=parameters[2]
+        principal_point_y=parameters[3]
         focal_x=focal_length_x/(width*0.5)
         focal_y=focal_length_y/(height*0.5)
-        self.proj_matrix=np.array([[focal_x,0,0,0],
-                  [0,focal_y,0,0],
+        principal_x=principal_point_x/(width*0.5)-1.0
+        principal_y=principal_point_y/(height*0.5)-1.0
+        self.proj_matrix=np.array([[focal_x,0,principal_x,0],
+                  [0,focal_y,principal_y,0],
                   [0,0,(z_far+z_near)/(z_far-z_near),-2*z_far*z_near/(z_far-z_near)],
                   [0,0,1,0]],dtype=np.float32).transpose()
-        self.inv_z_proj_matrix=np.array([[focal_x,0,0,0],
-                  [0,focal_y,0,0],
+        self.inv_z_proj_matrix=np.array([[focal_x,0,principal_x,0],
+                  [0,focal_y,principal_y,0],
                   [0,0,-z_near/(z_far-z_near),z_far*z_near/(z_far-z_near)],
                   [0,0,1,0]],dtype=np.float32).transpose()
         return
@@ -221,4 +225,3 @@ class CameraFrameDataset(Dataset):
         radius = diagonal * 1.1
         translate = -center
         return translate,radius
-        

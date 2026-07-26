@@ -322,8 +322,14 @@ def load_pointcloud(path:str):
     bin_path = os.path.join(path, "sparse/0/points3D.bin")
     txt_path = os.path.join(path, "sparse/0/points3D.txt")
 
-    if not os.path.exists(ply_path):
-        print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
+    ply_is_stale = (
+        os.path.exists(bin_path)
+        and os.path.exists(ply_path)
+        and os.path.getmtime(bin_path) > os.path.getmtime(ply_path)
+    )
+    if not os.path.exists(ply_path) or ply_is_stale:
+        reason = "stale" if ply_is_stale else "missing"
+        print(f"Converting points3D.bin to PLY because points3D.ply is {reason}.")
         try:
             xyz, rgb, _ = __read_points3D_binary(bin_path)
         except:

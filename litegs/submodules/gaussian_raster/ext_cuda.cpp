@@ -3,6 +3,7 @@
 #include "compact.h"
 #include "raster.h"
 #include "transform.h"
+#include "pose_jacobian.h"
 
 
 
@@ -11,6 +12,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("tileRange", &tileRange);
   m.def("create_ROI_AABB", &create_ROI_AABB);
   m.def("rasterize_forward", &rasterize_forward);
+  m.def("rasterize_pose_jacobian", &rasterize_pose_jacobian);
   m.def("rasterize_backward", &rasterize_backward);
   m.def("jacobianRayspace", &jacobianRayspace);
   m.def("createTransformMatrix_forward", &createTransformMatrix_forward);
@@ -25,4 +27,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("compact_visible_params_forward", &compact_visible_params_forward);
   m.def("compact_visible_params_backward", &compact_visible_params_backward);
   m.def("adamUpdate", &adamUpdate);
+  m.def("pose_jacobian_backward", &pose_jacobian_backward);
 }
