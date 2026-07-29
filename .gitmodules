@@ -1,4 +1,4 @@
 [submodule "litegs/submodules/fused_ssim"]
 	path = litegs/submodules/fused_ssim
-	url = https://github.com/kemchenj/fused-ssim.git
-	branch = fused-l1-ssim-loss
+	url = git@github.com:Jiaviz/fused-ssim.git
+	branch = polo-pose-derivatives
