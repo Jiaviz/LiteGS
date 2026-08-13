@@ -149,10 +149,12 @@ class DensityControllerOfficial(DensityControllerBase):
             del_indices=prune_mask.nonzero()[:del_limit,0]
             prune_mask=torch.zeros_like(prune_mask)
             prune_mask[del_indices]=True
-        print(
-            f"[LiteGS] Pruned {int(prune_mask.sum().item())} Gaussians; "
-            f"{int((~prune_mask).sum().item())} remain."
-        )
+        pruned_points = int(prune_mask.sum().item())
+        if pruned_points > 0:
+            print(
+                f"[LiteGS] Pruned {pruned_points} Gaussians; "
+                f"{int((~prune_mask).sum().item())} remain."
+            )
         self._prune_optimizer(~prune_mask,optimizer)
         optimizer.state.clear()#prune large point damage the img
         return
