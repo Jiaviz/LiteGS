@@ -171,6 +171,11 @@ class DensityControllerOfficial(DensityControllerBase):
         clone_mask=self.get_clone_mask(scale.exp())
         split_mask=self.get_split_mask(scale.exp())
         current_points = int(xyz.shape[-1])
+        # Avoid launching CUDA sampling/indexing kernels with zero-length
+        # selections. On some PyTorch/CUDA combinations that empty path raises
+        # a misleading "invalid device ordinal" instead of remaining a no-op.
+        if not bool((clone_mask | split_mask).any()):
+            return
         if self.max_gaussians > 0:
             remaining_capacity = self.max_gaussians - current_points
             candidate_mask = clone_mask | split_mask

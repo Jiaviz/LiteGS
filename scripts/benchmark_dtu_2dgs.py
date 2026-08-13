@@ -61,6 +61,14 @@ def main() -> None:
             "training": json.loads(training_stats_path.read_text()) if training_stats_path.exists() else None,
             "geometry": json.loads(metric_path.read_text()),
         }
+        rgb_output = output / "rgb_evaluation"
+        run([
+            sys.executable, str(ROOT / "scripts" / "evaluate_rgb.py"),
+            "--dataset", str(args.dataset), "--model", str(prediction),
+            "--output", str(rgb_output), "--dimension", str(dimension),
+            "--resolution", str(args.resolution),
+        ])
+        records[name]["rgb"] = json.loads((rgb_output / "rgb_metrics.json").read_text())
     vanilla, two_d = records["vanilla"], records["2dgs"]
     records["comparison"] = {
         "geometry_chamfer_improvement_percent": 100.0 * (
@@ -69,6 +77,10 @@ def main() -> None:
         "training_time_ratio_2dgs_over_vanilla": (
             two_d["training"]["training_seconds"] / vanilla["training"]["training_seconds"]
             if two_d["training"] and vanilla["training"] else None
+        ),
+        "foreground_psnr_delta_2dgs_minus_vanilla_db": (
+            two_d["rgb"]["mean_foreground_psnr"]
+            - vanilla["rgb"]["mean_foreground_psnr"]
         ),
     }
     report = args.output_root / "comparison.json"
