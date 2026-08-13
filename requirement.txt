@@ -4,3 +4,8 @@ tqdm
 pillow
 opencv-python
 matplotlib
+scipy
+scikit-learn
+open3d
+remotezip
+pytest

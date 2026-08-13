@@ -1,0 +1,31 @@
+{
+  "hardware": "NVIDIA GeForce RTX 4070 Ti SUPER",
+  "dataset": "DTU scan 24",
+  "resolution": [400, 300],
+  "random_seed": 0,
+  "requested_and_completed_iterations": 10000,
+  "initial_and_final_primitives": 30000,
+  "densification": false,
+  "vanilla_litegs": {
+    "training_seconds": 67.00253322500066,
+    "iterations_per_second": 149.24808837330195,
+    "peak_cuda_memory_bytes": 113946112,
+    "accuracy_mm": 3.8989802987903084,
+    "completeness_mm": 6.695591199518146,
+    "chamfer_l1_mm": 5.297285749154227
+  },
+  "cuda_2dgs": {
+    "training_seconds": 78.74827984799776,
+    "iterations_per_second": 126.9869007844018,
+    "peak_cuda_memory_bytes": 102544896,
+    "accuracy_mm": 3.7962066798015632,
+    "completeness_mm": 5.92721810656029,
+    "chamfer_l1_mm": 4.861712393180927
+  },
+  "comparison": {
+    "geometry_chamfer_improvement_percent": 8.222576175786717,
+    "training_time_ratio_2dgs_over_vanilla": 1.1753030229999484
+  },
+  "geometry_representation": "gaussian_primitive_centers",
+  "protocol": "DTU observation-mask/ground-plane crop, 0.2 mm prediction downsample, 20 mm outlier cap"
+}

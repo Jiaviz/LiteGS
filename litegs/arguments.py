@@ -67,6 +67,8 @@ class ModelParams(ParamGroup):
     eval = False
 
 class PipelineParams(ParamGroup):
+    random_seed = 0
+    gaussian_dimension = 3
     cluster_size = 128
     tile_size = 8
     sparse_grad = True
@@ -74,6 +76,7 @@ class PipelineParams(ParamGroup):
     device_preload = True
     enable_transmitance=False
     enable_depth=False
+    depth_ratio = 1.0
     def __init__(self, parser):
         super().__init__(parser, "Pipeline Parameters")
 
@@ -87,6 +90,10 @@ class OptimizationParams(ParamGroup):
     scaling_lr = 0.005
     rotation_lr = 0.001
     lambda_dssim = 0.2
+    lambda_depth = 0.1
+    lambda_normal = 0.05
+    lambda_distortion = 0.01
+    geometry_start_iteration = 1000
     def __init__(self, parser):
         super().__init__(parser, "Optimization Parameters")
 

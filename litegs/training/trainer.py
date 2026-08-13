@@ -4,6 +4,9 @@ import fused_ssim
 from tqdm import tqdm
 import numpy as np
 import os
+import json
+import time
+import math
 from PIL import Image
 import torch.cuda.nvtx as nvtx
 
@@ -14,6 +17,7 @@ from .. import scene
 from . import optimizer
 from ..data import CameraFrameDataset
 from .. import render
+from ..render import surfel
 from .optimizer import SparseGaussianAdam
 from ..utils import wrapper
 from ..utils.statistic_helper import StatisticsHelperInst
@@ -31,6 +35,11 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
           test_epochs=[],save_ply=[],save_checkpoint=[],start_checkpoint:str=None,
           save_eval_images:bool=False,eval_image_count:int=8):
     
+    torch.manual_seed(pp.random_seed)
+    np.random.seed(pp.random_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(pp.random_seed)
+
     cameras_info:dict[int,data.CameraInfo]=None
     camera_frames:list[data.CameraFrame]=None
     cameras_info,camera_frames,init_xyz,init_color=io_manager.load_colmap_result(lp.source_path,lp.images)#lp.sh_degree,lp.resolution
@@ -47,15 +56,19 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
         training_frames=camera_frames
         test_frames=None
     mask_root=os.path.join(lp.source_path,"masks")
+    depth_root=os.path.join(lp.source_path,"depths")
+    normal_root=os.path.join(lp.source_path,"normals")
     has_masks=os.path.isdir(mask_root)
+    has_depth_priors=os.path.isdir(depth_root)
+    has_normal_priors=os.path.isdir(normal_root)
     if has_masks:
         pp.enable_transmitance=True
         print("[LiteGS] Enabling mask-aware densification for object-centric training.")
-    trainingset=CameraFrameDataset(cameras_info,training_frames,lp.resolution,pp.device_preload,mask_root=mask_root)
+    trainingset=CameraFrameDataset(cameras_info,training_frames,lp.resolution,pp.device_preload,mask_root=mask_root,depth_root=depth_root if has_depth_priors else None,normal_root=normal_root if has_normal_priors else None)
     train_loader = DataLoader(trainingset, batch_size=1,shuffle=True,pin_memory=not pp.device_preload)
     test_loader=None
     if lp.eval:
-        testset=CameraFrameDataset(cameras_info,test_frames,lp.resolution,pp.device_preload,mask_root=mask_root)
+        testset=CameraFrameDataset(cameras_info,test_frames,lp.resolution,pp.device_preload,mask_root=mask_root,depth_root=depth_root if os.path.isdir(depth_root) else None,normal_root=normal_root if os.path.isdir(normal_root) else None)
         test_loader = DataLoader(testset, batch_size=1,shuffle=True,pin_memory=not pp.device_preload)
     norm_trans,norm_radius=trainingset.get_norm()
 
@@ -90,14 +103,20 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
     actived_sh_degree=0
 
     #init
-    total_epoch=int(op.iterations/len(trainingset))
+    total_epoch=math.ceil(op.iterations/len(trainingset))
     if dp.densify_until<0:
         dp.densify_until=int(int(total_epoch/2)/dp.opacity_reset_interval)*dp.opacity_reset_interval
-    density_controller=densify.DensityControllerOfficial(norm_radius,dp,pp.cluster_size>0)
+    density_controller=densify.DensityControllerOfficial(norm_radius,dp,pp.cluster_size>0,pp.gaussian_dimension)
     statistics_chunk_num = xyz.shape[-2] if pp.cluster_size else 1
     StatisticsHelperInst.reset(statistics_chunk_num,xyz.shape[-1],density_controller.is_densify_actived)
     progress_bar = tqdm(range(start_epoch, total_epoch), desc="Training progress")
     progress_bar.update(0)
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+    training_started_at=time.perf_counter()
+    completed_steps=0
+    accumulated_losses={"rgb":0.0,"alpha":0.0,"depth":0.0,"normal":0.0,"distortion":0.0,"total":0.0}
 
     for epoch in range(start_epoch,total_epoch):
 
@@ -110,34 +129,75 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 actived_sh_degree=min(int(epoch/5),lp.sh_degree)
 
         with StatisticsHelperInst.try_start(epoch):
-            for view_matrix,proj_matrix,frustumplane,gt_image,gt_mask in train_loader:
+            for view_matrix,proj_matrix,frustumplane,gt_image,gt_mask,gt_depth,gt_normal in train_loader:
+                if completed_steps >= op.iterations:
+                    break
                 view_matrix=view_matrix.cuda()
                 proj_matrix=proj_matrix.cuda()
                 frustumplane=frustumplane.cuda()
                 gt_image=gt_image.cuda()/255.0
                 gt_mask=gt_mask.cuda().float()
+                gt_depth=gt_depth.cuda().float()
+                gt_normal=gt_normal.cuda().float()
                 inverse_mask = 1.0 - gt_mask
 
                 #cluster culling
                 visible_chunkid,culled_xyz,culled_scale,culled_rot,culled_sh_0,culled_sh_rest,culled_opacity=render.render_preprocess(cluster_origin,cluster_extend,frustumplane,
                                                                                                                xyz,scale,rot,sh_0,sh_rest,opacity,op,pp)
-                img,transmitance,depth,normal=render.render(view_matrix,proj_matrix,culled_xyz,culled_scale,culled_rot,culled_sh_0,culled_sh_rest,culled_opacity,
-                                                            actived_sh_degree,gt_image.shape[2:],pp)
+                if pp.gaussian_dimension == 2:
+                    img,transmitance,depth,normal,surface_normal,distortion,_,_=surfel.render(
+                        view_matrix,proj_matrix,culled_xyz,culled_scale,culled_rot,culled_sh_0,culled_sh_rest,culled_opacity,
+                        actived_sh_degree,gt_image.shape[2:],pp,compute_surface_normal=not has_normal_priors)
+                else:
+                    img,transmitance,depth,normal=render.render(view_matrix,proj_matrix,culled_xyz,culled_scale,culled_rot,culled_sh_0,culled_sh_rest,culled_opacity,
+                                                                actived_sh_degree,gt_image.shape[2:],pp)
+                    surface_normal=distortion=None
 
                 if has_masks:
                     rgb_loss_map = fused_ssim.FusedL1SSIMLossMap.apply(0.2, 0.01 ** 2, 0.03 ** 2, img, gt_image, "same", True)
                     rgb_loss = __safe_masked_mean(rgb_loss_map, gt_mask.expand_as(rgb_loss_map))
                     # bg_rgb_loss = __safe_masked_mean(img.abs(), inverse_mask.expand_as(img))
                     loss = rgb_loss # + 0.5 * bg_rgb_loss
+                    alpha_loss=torch.zeros((),device=loss.device)
                     if transmitance is not None:
                         alpha = 1.0 - transmitance
                         fg_alpha_loss = __safe_masked_mean((1.0 - alpha).abs(), gt_mask)
                         bg_alpha_loss = __safe_masked_mean(alpha.abs(), inverse_mask)
-                        loss = loss + 2.0 * fg_alpha_loss + bg_alpha_loss * 2
+                        alpha_loss=2.0 * fg_alpha_loss + bg_alpha_loss * 2
+                        loss = loss + alpha_loss
                 else:
                     l1_loss=__l1_loss(img,gt_image)
                     ssim_loss:torch.Tensor=fused_ssim.fused_ssim(img,gt_image)
                     loss=(1.0-op.lambda_dssim)*l1_loss+op.lambda_dssim*(1-ssim_loss)
+                    rgb_loss=loss
+                    alpha_loss=torch.zeros((),device=loss.device)
+                depth_loss=normal_loss=distortion_loss=torch.zeros((),device=loss.device)
+                if pp.gaussian_dimension == 2 and epoch * len(trainingset) >= op.geometry_start_iteration:
+                    valid_depth = (gt_depth > 0).float() * gt_mask
+                    if valid_depth.sum() > 0:
+                        # Scale-invariant log-depth is stable across DTU normalization.
+                        depth_error = (depth.clamp_min(1e-6).log() - gt_depth.clamp_min(1e-6).log()).abs()
+                        depth_loss=op.lambda_depth * __safe_masked_mean(depth_error, valid_depth)
+                        loss = loss + depth_loss
+                    valid_normal = (gt_normal.square().sum(dim=1, keepdim=True) > 0.25).float() * gt_mask
+                    target_normal = torch.nn.functional.normalize(gt_normal, dim=1, eps=1e-6)
+                    if valid_normal.sum() > 0:
+                        normal_error = 1.0 - (normal * target_normal).sum(dim=1, keepdim=True).abs()
+                        normal_loss=op.lambda_normal * __safe_masked_mean(normal_error, valid_normal)
+                        loss = loss + normal_loss
+                    elif surface_normal is not None:
+                        normal_error = 1.0 - (normal * surface_normal).sum(dim=1, keepdim=True).abs()
+                        normal_loss=op.lambda_normal * __safe_masked_mean(normal_error, gt_mask)
+                        loss = loss + normal_loss
+                    distortion_loss=op.lambda_distortion * __safe_masked_mean(distortion, gt_mask)
+                    loss = loss + distortion_loss
+                accumulated_losses["rgb"] += float(rgb_loss.detach())
+                accumulated_losses["alpha"] += float(alpha_loss.detach())
+                accumulated_losses["depth"] += float(depth_loss.detach())
+                accumulated_losses["normal"] += float(normal_loss.detach())
+                accumulated_losses["distortion"] += float(distortion_loss.detach())
+                accumulated_losses["total"] += float(loss.detach())
+                completed_steps += 1
                 loss.backward()
                 if StatisticsHelperInst.bStart:
                     StatisticsHelperInst.backward_callback()
@@ -155,7 +215,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                     loaders["Testset"]=test_loader
                 for name,loader in loaders.items():
                     psnr_list=[]
-                    for eval_index,(view_matrix,proj_matrix,frustumplane,gt_image,gt_mask) in enumerate(loader):
+                    for eval_index,(view_matrix,proj_matrix,frustumplane,gt_image,gt_mask,gt_depth,gt_normal) in enumerate(loader):
                         view_matrix=view_matrix.cuda()
                         proj_matrix=proj_matrix.cuda()
                         frustumplane=frustumplane.cuda()
@@ -163,8 +223,10 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                         gt_mask=gt_mask.cuda().float()
                         _,culled_xyz,culled_scale,culled_rot,culled_sh_0,culled_sh_rest,culled_opacity=render.render_preprocess(cluster_origin,cluster_extend,frustumplane,
                                                                                                                 xyz,scale,rot,sh_0,sh_rest,opacity,op,pp)
-                        img,transmitance,depth,normal=render.render(view_matrix,proj_matrix,culled_xyz,culled_scale,culled_rot,culled_sh_0,culled_sh_rest,culled_opacity,
-                                                                    actived_sh_degree,gt_image.shape[2:],pp)
+                        if pp.gaussian_dimension == 2:
+                            img,transmitance,depth,normal,_,_,_,_=surfel.render(view_matrix,proj_matrix,culled_xyz,culled_scale,culled_rot,culled_sh_0,culled_sh_rest,culled_opacity,actived_sh_degree,gt_image.shape[2:],pp,compute_surface_normal=False)
+                        else:
+                            img,transmitance,depth,normal=render.render(view_matrix,proj_matrix,culled_xyz,culled_scale,culled_rot,culled_sh_0,culled_sh_rest,culled_opacity,actived_sh_degree,gt_image.shape[2:],pp)
                         if has_masks:
                             squared_error = (img - gt_image).square() * gt_mask
                             mse = squared_error.sum() / (gt_mask.sum() * img.shape[1]).clamp_min(1.0)
@@ -201,6 +263,12 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                         )
                     )
 
+        if completed_steps >= op.iterations and epoch < total_epoch-1:
+            # Keep final checkpoint/export behavior tied to the actual last
+            # epoch when the requested iteration budget is not divisible by
+            # the number of views.
+            total_epoch=epoch+1
+
         xyz,scale,rot,sh_0,sh_rest,opacity=density_controller.step(opt,epoch)
         progress_bar.update()  
 
@@ -222,4 +290,28 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
         if epoch in save_checkpoint:
             io_manager.save_checkpoint(lp.model_path,epoch,opt,schedular)
     
-    return
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    training_seconds=time.perf_counter()-training_started_at
+    stats={
+        "gaussian_dimension":int(pp.gaussian_dimension),
+        "random_seed":int(pp.random_seed),
+        "requested_iterations":int(op.iterations),
+        "completed_iterations":int(completed_steps),
+        "epochs":int(total_epoch-start_epoch),
+        "training_seconds":float(training_seconds),
+        "iterations_per_second":float(completed_steps/max(training_seconds,1e-9)),
+        "initial_primitives":int(init_points_num),
+        "final_primitives":int(xyz.shape[-1]),
+        "has_masks":bool(has_masks),
+        "has_depth_priors":bool(has_depth_priors),
+        "has_normal_priors":bool(has_normal_priors),
+        "mean_weighted_losses":{key:value/max(completed_steps,1) for key,value in accumulated_losses.items()},
+        "peak_cuda_memory_bytes":int(torch.cuda.max_memory_allocated()) if torch.cuda.is_available() else 0,
+    }
+    os.makedirs(lp.model_path,exist_ok=True)
+    with open(os.path.join(lp.model_path,"training_stats.json"),"w",encoding="utf-8") as file:
+        json.dump(stats,file,indent=2)
+        file.write("\n")
+    tqdm.write("[LiteGS] Training statistics: {:.2f}s, {:.1f} iter/s, {} primitives.".format(training_seconds,stats["iterations_per_second"],stats["final_primitives"]))
+    return stats

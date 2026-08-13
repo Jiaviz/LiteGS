@@ -105,12 +105,11 @@ if __name__ == "__main__":
             ssim_list=[]
             psnr_list=[]
             lpips_list=[]
-            for index,(view_matrix,proj_matrix,frustumplane,gt_image,_gt_mask,idx) in enumerate(loader):
+            for index,(view_matrix,proj_matrix,frustumplane,gt_image,_gt_mask,_gt_depth,_gt_normal) in enumerate(loader):
                 view_matrix=view_matrix.cuda()
                 proj_matrix=proj_matrix.cuda()
                 frustumplane=frustumplane.cuda()
                 gt_image=gt_image.cuda()/255.0
-                idx=idx.cuda()
                 if op.learnable_viewproj:
                     if loader_name=="Trainingset":
                         #fix view matrix

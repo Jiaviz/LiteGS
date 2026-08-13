@@ -82,7 +82,7 @@ class DensityControllerBase:
     
 class DensityControllerOfficial(DensityControllerBase):
     @torch.no_grad()
-    def __init__(self,screen_extent:int,densify_params:DensifyParams,bCluster:bool)->None:
+    def __init__(self,screen_extent:int,densify_params:DensifyParams,bCluster:bool,gaussian_dimension:int=3)->None:
         self.grad_threshold=densify_params.densify_grad_threshold
         self.min_opacity=densify_params.opacity_threshold
         self.percent_dense=densify_params.percent_dense
@@ -90,6 +90,7 @@ class DensityControllerOfficial(DensityControllerBase):
         self.screen_extent=screen_extent
         self.max_screen_size=densify_params.screen_size_threshold
         self.max_gaussians=int(densify_params.max_gaussians)
+        self.gaussian_dimension=int(gaussian_dimension)
         self._reported_gradient_stats = False
         super(DensityControllerOfficial,self).__init__(densify_params,bCluster)
         return
@@ -217,6 +218,9 @@ class DensityControllerOfficial(DensityControllerBase):
 
         #split
         stds=scale[...,split_mask].exp()
+        if self.gaussian_dimension == 2:
+            stds = stds.clone()
+            stds[2].zero_()
         means=torch.zeros((3,stds.size(-1)),device="cuda")
         samples = torch.normal(mean=means, std=stds).unsqueeze(0)
         transform_matrix=wrapper.CreateTransformMatrix.call_fused(scale[...,split_mask].exp(),torch.nn.functional.normalize(rot[...,split_mask],dim=0))
@@ -229,7 +233,10 @@ class DensityControllerOfficial(DensityControllerBase):
         append_xyz=torch.cat((split_xyz,clone_xyz),dim=-1)
         xyz.data[...,split_mask]-=shift
         
-        split_scale = (scale[...,split_mask].exp() / (0.8*2)).log()
+        split_scale = scale[...,split_mask].clone()
+        split_scale[:self.gaussian_dimension] = (
+            split_scale[:self.gaussian_dimension].exp() / (0.8 * 2)
+        ).log()
         clone_scale = scale[...,clone_mask]
         append_scale = torch.cat((split_scale,clone_scale),dim=-1)
         scale.data[...,split_mask]=split_scale

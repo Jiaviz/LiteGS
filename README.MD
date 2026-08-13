@@ -91,6 +91,83 @@ Begin training with the following command:
 
 `./example_train.py --sh_degree 3 -s DATA_SOURCE -i IMAGE_FOLDER -m OUTPUT_PATH`
 
+## CUDA 2D Gaussian Splatting
+
+The `feature/2dgs-cuda` implementation represents every primitive as a
+perspective-correct elliptical surfel. Forward rasterization and its backward
+pass use the CUDA kernels in `litegs/submodules/diff_surfel_rasterization`, not
+a Python rasterizer. Training supports masked RGB, metric/normalized camera-z
+depth (`depths/<image-stem>.npy`) and view-space normal
+(`normals/<image-stem>.npy`) supervision, plus the original 2DGS distortion
+regularizer. If normal priors are absent, rendered normals are regularized by
+normals derived from rendered depth.
+
+Install the additional renderer in the same environment as LiteGS:
+
+```bash
+CUDA_HOME=/usr/local/cuda pip install -v \
+  ./litegs/submodules/diff_surfel_rasterization
+```
+
+The fast preset disables clustering, uses the CUDA surfel path, delays geometry
+losses briefly for appearance stabilization, and bounds densification:
+
+```bash
+python example_train_2dgs.py \
+  -s /path/to/colmap_dataset \
+  -m outputs/object_2dgs \
+  --resolution 4
+```
+
+Every run writes `training_stats.json` with exact completed iterations,
+iterations/s, peak allocated CUDA memory, primitive counts, and mean weighted
+RGB/alpha/depth/normal/distortion losses.
+
+### Reproduce the DTU scan-24 comparison
+
+The scripts operate on the IDR-format sample in `/home/jarvi/data/DTU/scan24`
+and use the official DTU laser scan only for constructing depth/normal training
+priors and crop-aware geometry evaluation:
+
+```bash
+python scripts/prepare_dtu.py \
+  --input /home/jarvi/data/DTU/scan24 \
+  --output /home/jarvi/data/DTU_LiteGS/scan24
+
+python scripts/download_dtu_scan_gt.py \
+  --output /home/jarvi/data/DTU_Official_scan24 --scan 24
+
+python scripts/generate_dtu_priors.py \
+  --scan-input /home/jarvi/data/DTU/scan24 \
+  --dataset-output /home/jarvi/data/DTU_LiteGS/scan24 \
+  --gt-ply /home/jarvi/data/DTU_Official_scan24/Points/stl/stl024_total.ply \
+  --resolution 4
+
+python scripts/benchmark_dtu_2dgs.py \
+  --dataset /home/jarvi/data/DTU_LiteGS/scan24 \
+  --scan-input /home/jarvi/data/DTU/scan24 \
+  --official-root /home/jarvi/data/DTU_Official_scan24 \
+  --output-root /tmp/litegs_dtu_scan24
+```
+
+`comparison.json` records matched vanilla LiteGS and 2DGS timing and the DTU
+crop-aware accuracy/completeness/Chamfer-L1 of Gaussian primitive centers. This
+is explicitly a center-geometry metric rather than a mesh-reconstruction score.
+
+On DTU scan 24 at 400x300, 30k fixed primitives, seed 0, and exactly 10k
+optimization steps on an RTX 4070 Ti SUPER, the matched reference run measured:
+
+| Method | Train time | Iter/s | Peak allocated VRAM | Accuracy | Completeness | Chamfer-L1 |
+|---|---:|---:|---:|---:|---:|---:|
+| Vanilla LiteGS | 67.00 s | 149.2 | 113.9 MB | 3.899 mm | 6.696 mm | 5.297 mm |
+| CUDA 2DGS + RGB/depth/normal | 78.75 s | 127.0 | 102.5 MB | 3.796 mm | 5.927 mm | 4.862 mm |
+
+Thus 2DGS improved center-geometry Chamfer-L1 by 8.22%, used about 10% less
+peak allocated VRAM, and retained 85% of vanilla LiteGS throughput despite
+rendering and supervising the additional geometric buffers. The benchmark used
+fixed primitive counts to isolate rasterizer/loss cost; the fast entry point
+also supports bounded tangent-plane densification for production training.
+
 ## Faster
 
 The training results of LiteGS using the Mip-NeRF 360 dataset on an RTX 3090 are presented below. The training and evaluation command used is:

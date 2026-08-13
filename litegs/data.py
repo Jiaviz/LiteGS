@@ -78,9 +78,13 @@ class CameraFrame:
         self.name:str=name
         self.img_source:str=img_source
         self.mask_source:str|None=None
+        self.depth_source:str|None=None
+        self.normal_source:str|None=None
         self.xys:npt.NDArray=np.array(xys)
         self.image={}
         self.mask={}
+        self.depth={}
+        self.normal={}
         return
     
     def load_image(self,downsample:int=-1):
@@ -122,6 +126,35 @@ class CameraFrame:
             resized_mask = np.array(mask_image.resize(resolution, resample=PIL.Image.Resampling.NEAREST), dtype=np.float32)
             self.mask[downsample] = (resized_mask > 127).astype(np.float32)[None, ...]
         return self.mask[downsample]
+
+    def load_depth(self, downsample: int = -1):
+        if self.depth.get(downsample, None) is None:
+            shape = self.load_image(downsample).shape[1:]
+            if self.depth_source is None or not os.path.exists(self.depth_source):
+                self.depth[downsample] = np.zeros((1, *shape), dtype=np.float32)
+            else:
+                source = np.load(self.depth_source).astype(np.float32)
+                if source.ndim == 3:
+                    source = source.squeeze()
+                tensor = torch.from_numpy(source)[None, None]
+                tensor = torch.nn.functional.interpolate(tensor, size=shape, mode="nearest")
+                self.depth[downsample] = tensor[0].numpy()
+        return self.depth[downsample]
+
+    def load_normal(self, downsample: int = -1):
+        if self.normal.get(downsample, None) is None:
+            shape = self.load_image(downsample).shape[1:]
+            if self.normal_source is None or not os.path.exists(self.normal_source):
+                self.normal[downsample] = np.zeros((3, *shape), dtype=np.float32)
+            else:
+                source = np.load(self.normal_source).astype(np.float32)
+                if source.shape[-1] == 3:
+                    source = source.transpose(2, 0, 1)
+                tensor = torch.from_numpy(source)[None]
+                tensor = torch.nn.functional.interpolate(tensor, size=shape, mode="bilinear", align_corners=False)
+                tensor = torch.nn.functional.normalize(tensor, dim=1, eps=1e-6)
+                self.normal[downsample] = tensor[0].numpy()
+        return self.normal[downsample]
     
     def get_viewmatrix(self)->npt.NDArray:
         return self.view_matrix
@@ -169,7 +202,7 @@ class CameraFrameDataset(Dataset):
         frustumplane[5,3]=viewproj_matrix[3,3]-viewproj_matrix[3,2]
         return frustumplane
     
-    def __init__(self,cameras:dict[int,PinHoleCameraInfo],frames:list[CameraFrame],downsample:int=-1,bDevice=True,mask_root:str|None=None):
+    def __init__(self,cameras:dict[int,PinHoleCameraInfo],frames:list[CameraFrame],downsample:int=-1,bDevice=True,mask_root:str|None=None,depth_root:str|None=None,normal_root:str|None=None):
         self.cameras=cameras
         self.frames=frames
         self.downsample=downsample
@@ -177,6 +210,10 @@ class CameraFrameDataset(Dataset):
         if mask_root is not None:
             for frame in frames:
                 frame.mask_source = os.path.join(mask_root, frame.name)
+        for frame in frames:
+            stem = os.path.splitext(frame.name)[0] + ".npy"
+            frame.depth_source = os.path.join(depth_root, stem) if depth_root else None
+            frame.normal_source = os.path.join(normal_root, stem) if normal_root else None
         if bDevice:
             for camera in cameras.values():
                 camera.proj_matrix=torch.Tensor(camera.proj_matrix).cuda()
@@ -186,6 +223,10 @@ class CameraFrameDataset(Dataset):
                     frame.image[key]=torch.tensor(frame.image[key]).cuda()
                 for key in frame.mask.keys():
                     frame.mask[key]=torch.tensor(frame.mask[key]).cuda()
+                for key in frame.depth.keys():
+                    frame.depth[key]=torch.tensor(frame.depth[key]).cuda()
+                for key in frame.normal.keys():
+                    frame.normal[key]=torch.tensor(frame.normal[key]).cuda()
         for frame in self.frames:
             frustumplane=self.__get_frustumplane(frame.get_viewmatrix(),self.cameras[frame.camera_id].get_project_matrix())
             if bDevice:
@@ -197,15 +238,20 @@ class CameraFrameDataset(Dataset):
     def __len__(self):
         return len(self.frames)
     
-    def __getitem__(self,idx:int)->tuple[torch.Tensor,torch.Tensor,torch.Tensor,torch.Tensor,torch.Tensor]:
+    def __getitem__(self,idx:int):
         image=self.frames[idx].load_image(self.downsample)
         mask=self.frames[idx].load_mask(self.downsample)
+        depth=self.frames[idx].load_depth(self.downsample)
+        normal=self.frames[idx].load_normal(self.downsample)
         view_matrix=self.frames[idx].get_viewmatrix()
         proj_matrix=self.cameras[self.frames[idx].camera_id].get_inv_z_project_matrix()
         frustumplane=self.frustumplanes[idx]
         if torch.is_tensor(image) and not torch.is_tensor(mask):
             mask = torch.tensor(mask, device=image.device)
-        return view_matrix,proj_matrix,frustumplane,image,mask
+        if torch.is_tensor(image) and not torch.is_tensor(depth):
+            depth = torch.tensor(depth, device=image.device)
+            normal = torch.tensor(normal, device=image.device)
+        return view_matrix,proj_matrix,frustumplane,image,mask,depth,normal
     
     def get_norm(self)->tuple[float,float]:
         def get_center_and_diag(cam_centers):
