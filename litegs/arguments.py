@@ -107,7 +107,7 @@ class DensifyParams(ParamGroup):
     opacity_threshold=0.005
     prune_large_point_from=40
     screen_size_threshold=128#tile
-    percent_dense = 0.01
+    percent_dense = 0.003
     # Hard safety limit for unclustered/object-centric training. A negative
     # value preserves the original unlimited behavior.
     max_gaussians = -1
