@@ -568,6 +568,9 @@ __global__ void raster_backward_kernel_warp_reduction(
                                 accum_depth = alpha * collected_depth[i] + (1.0f - alpha) * accum_depth;
                             }
 
+                            // The forward clamps alpha at 0.99: saturated splats have no
+                            // opacity/geometry derivative, but retain their color derivative.
+                            if (cur_color.w * G >= 0.99f) d_alpha = 0.0f;
                             //opacity
                             grad_opacity = G * d_alpha;
 
@@ -860,6 +863,8 @@ __global__ void raster_backward_kernel_multibatch_reduction(
                         accum_depth = alpha * collected_depth[i] + (1.0f - alpha) * accum_depth;
                     }
 
+                    // Match the alpha clamp in rasterize_forward.
+                    if (cur_color.w * G >= 0.99f) d_alpha = 0.0f;
                     //opacity
                     grad_opacity[shared_mem_offset] = G * d_alpha;
 
